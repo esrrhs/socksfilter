@@ -8,12 +8,14 @@ import (
 	"github.com/esrrhs/go-engine/src/loggo"
 	"github.com/esrrhs/go-engine/src/network"
 	"io"
+	"math/rand"
 	"net"
 	"strings"
 )
 
 var listen = flag.String("l", ":1080", "listen addr")
-var servers = flag.String("s", "server1,server2,server3", "server addr")
+var servers = flag.String("s", "server1 server2 server3", "server addr")
+var userand = flag.Bool("rand", true, "select rand server addr")
 var skip = flag.String("skip", "CN", "skip country")
 var filename = flag.String("file", "GeoLite2-Country.mmdb", "ip file")
 var loglevel = flag.String("loglevel", "info", "log level")
@@ -24,7 +26,7 @@ func main() {
 
 	flag.Parse()
 
-	if *servers == "server1,server2,server3" {
+	if *servers == "server1 server2 server3" {
 		fmt.Print("need servers\n")
 		flag.Usage()
 		return
@@ -134,7 +136,14 @@ func process(conn *net.TCPConn) {
 
 func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr) {
 
-	for _, server := range strings.Split(*servers, ",") {
+	ss := strings.Fields(*servers)
+	if *userand {
+		rand.Shuffle(len(ss), func(i, j int) {
+			ss[i], ss[j] = ss[j], ss[i]
+		})
+	}
+
+	for _, server := range ss {
 
 		tcpaddrProxy, err := net.ResolveTCPAddr("tcp", server)
 		if err != nil {
@@ -162,7 +171,7 @@ func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPA
 			continue
 		}
 
-		loggo.Info("client accept new proxy local tcp %s %s", tcpsrcaddr.String(), targetAddr)
+		loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
 		go transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
 		go transfer(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String())
