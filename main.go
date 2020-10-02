@@ -24,7 +24,7 @@ func main() {
 
 	flag.Parse()
 
-	if *filename == "server1,server2,server3" {
+	if *servers == "server1,server2,server3" {
 		fmt.Print("need servers\n")
 		flag.Usage()
 		return
