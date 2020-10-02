@@ -10,4 +10,7 @@ socks5过滤器
 ```
 # ./socksfilter -l :1080 -s "yourserver1:1080 yourserver2:1080 yourserver3:1080" -skip CN
 ```
-
+* 使用docker
+```
+# docker run --name socksfilter -d --restart=always --network host esrrhs/socksfilter ./socksfilter -l :1080 -s "yourserver1:1080 yourserver2:1080 yourserver3:1080" -skip CN
+```
