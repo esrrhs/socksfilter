@@ -205,6 +205,6 @@ func transfer(destination io.WriteCloser, source io.ReadCloser, dst string, src 
 	defer destination.Close()
 	defer source.Close()
 	loggo.Info("transfer client begin transfer from %s -> %s", src, dst)
-	io.Copy(destination, source)
-	loggo.Info("transfer client end transfer from %s -> %s", src, dst)
+	n, err := io.Copy(destination, source)
+	loggo.Info("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
 }
