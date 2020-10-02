@@ -6,4 +6,5 @@ RUN go install github.com/esrrhs/socksfilter
 
 FROM debian
 COPY --from=build-env /go/bin/socksfilter .
+COPY GeoLite2-Country.mmdb .
 WORKDIR ./

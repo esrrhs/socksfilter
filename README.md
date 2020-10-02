@@ -8,6 +8,9 @@ socks5过滤器
 # 使用
 * 监听本机1080端口，绕过CN地区，非CN地区，转发到后端随机的socks5 server
 ```
-# ./socksfilter -l :1080 -s "yourserver1:1080,yourserver2:1080" -skip CN
+# ./socksfilter -l :1080 -s "yourserver1:1080 yourserver2:1080 yourserver3:1080" -skip CN
 ```
-
+* 使用docker
+```
+# docker run --name socksfilter -d --restart=always --network host esrrhs/socksfilter ./socksfilter -l :1080 -s "yourserver1:1080 yourserver2:1080 yourserver3:1080" -skip CN
+```
