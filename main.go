@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"github.com/esrrhs/go-engine/src/common"
 	"github.com/esrrhs/go-engine/src/geoip"
 	"github.com/esrrhs/go-engine/src/loggo"
@@ -22,6 +23,12 @@ var noprint = flag.Int("noprint", 0, "print stdout")
 func main() {
 
 	flag.Parse()
+
+	if *filename == "server1,server2,server3" {
+		fmt.Print("need servers\n")
+		flag.Usage()
+		return
+	}
 
 	level := loggo.LEVEL_INFO
 	if loggo.NameToLevel(*loglevel) >= 0 {
