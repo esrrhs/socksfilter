@@ -8,9 +8,11 @@ import (
 	"github.com/esrrhs/go-engine/src/network"
 	"io"
 	"net"
+	"strings"
 )
 
 var listen = flag.String("l", ":1080", "listen addr")
+var servers = flag.String("s", "server1,server2,server3", "server addr")
 var skip = flag.String("skip", "CN", "skip country")
 var filename = flag.String("file", "GeoLite2-Country.mmdb", "ip file")
 var loglevel = flag.String("loglevel", "info", "log level")
@@ -88,13 +90,13 @@ func process(conn *net.TCPConn) {
 
 	var err error = nil
 	if err = network.Sock5HandshakeBy(conn, "", ""); err != nil {
-		loggo.Error("socks handshake: %s", err)
+		loggo.Error("process socks handshake: %s", err)
 		conn.Close()
 		return
 	}
 	_, targetAddr, err := network.Sock5GetRequest(conn)
 	if err != nil {
-		loggo.Error("error getting request: %s", err)
+		loggo.Error("process error getting request: %s", err)
 		conn.Close()
 		return
 	}
@@ -103,59 +105,78 @@ func process(conn *net.TCPConn) {
 	// But if connection failed, the client will get connection reset error.
 	_, err = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x43})
 	if err != nil {
-		loggo.Error("send connection confirmation: %s", err)
+		loggo.Error("process send connection confirmation: %s", err)
 		conn.Close()
 		return
 	}
 
-	loggo.Info("accept new sock5 conn: %s", targetAddr)
-
 	tcpaddrTarget, err := net.ResolveTCPAddr("tcp", targetAddr)
 	if err != nil {
-		loggo.Info("tcp ResolveTCPAddr fail: %s %s", targetAddr, err.Error())
+		loggo.Info("process tcp ResolveTCPAddr fail: %s %s", targetAddr, err.Error())
 		return
 	}
+
+	loggo.Info("process accept new sock5 conn: %s", targetAddr)
+
+	if need_proxy(targetAddr) {
+		process_proxy(conn, targetAddr, tcpaddrTarget)
+	} else {
+		process_direct(conn, targetAddr, tcpaddrTarget)
+	}
+}
+
+func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr) {
+
+	for _, server := range strings.Split(*servers, ",") {
+
+		tcpaddrProxy, err := net.ResolveTCPAddr("tcp", server)
+		if err != nil {
+			loggo.Info("process_proxy tcp ResolveTCPAddr fail: %s %s", server, err.Error())
+			continue
+		}
+
+		proxyconn, err := net.DialTCP("tcp", nil, tcpaddrProxy)
+		if err != nil {
+			loggo.Info("process_proxy tcp DialTCP fail: %s %s", targetAddr, err.Error())
+			continue
+		}
+
+		tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
+
+		err = network.Sock5Handshake(proxyconn, 1000, "", "")
+		if err != nil {
+			loggo.Info("process_proxy Sock5Handshake fail: %s %s", targetAddr, err.Error())
+			continue
+		}
+
+		err = network.Sock5SetRequest(proxyconn, tcpaddrTarget.IP.String(), tcpaddrTarget.Port, 1000)
+		if err != nil {
+			loggo.Info("process_proxy Sock5SetRequest fail: %s %s", targetAddr, err.Error())
+			continue
+		}
+
+		loggo.Info("client accept new proxy local tcp %s %s", tcpsrcaddr.String(), targetAddr)
+
+		go transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
+		go transfer(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String())
+
+		return
+	}
+
+	loggo.Info("process_proxy no valid servers fail: %s", *servers)
+}
+
+func process_direct(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr) {
 
 	targetconn, err := net.DialTCP("tcp", nil, tcpaddrTarget)
 	if err != nil {
-		loggo.Info("tcp DialTCP fail: %s %s", targetAddr, err.Error())
+		loggo.Info("process_direct tcp DialTCP fail: %s %s", targetAddr, err.Error())
 		return
 	}
-
-	if need_proxy(targetAddr) {
-		process_proxy(conn, targetAddr, targetconn, tcpaddrTarget)
-	} else {
-		process_direct(conn, targetAddr, targetconn, tcpaddrTarget)
-	}
-}
-
-func process_proxy(conn *net.TCPConn, targetAddr string, targetconn *net.TCPConn, tcpaddrTarget *net.TCPAddr) {
 
 	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
 
-	loggo.Info("client accept new proxy local tcp %s %s", tcpsrcaddr.String(), targetAddr)
-
-	err := network.Sock5Handshake(targetconn, 1000, "", "")
-	if err != nil {
-		loggo.Info("Sock5Handshake fail: %s %s", targetAddr, err.Error())
-		return
-	}
-
-	err = network.Sock5SetRequest(targetconn, tcpaddrTarget.IP.String(), tcpaddrTarget.Port, 1000)
-	if err != nil {
-		loggo.Info("Sock5SetRequest fail: %s %s", targetAddr, err.Error())
-		return
-	}
-
-	go transfer(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String())
-	go transfer(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String())
-}
-
-func process_direct(conn *net.TCPConn, targetAddr string, targetconn *net.TCPConn, tcpaddrTarget *net.TCPAddr) {
-
-	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
-
-	loggo.Info("client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
+	loggo.Info("process_direct client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
 
 	go transfer(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String())
 	go transfer(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String())
@@ -167,7 +188,7 @@ func transfer(destination io.WriteCloser, source io.ReadCloser, dst string, src 
 
 	defer destination.Close()
 	defer source.Close()
-	loggo.Info("client begin transfer from %s -> %s", src, dst)
+	loggo.Info("transfer client begin transfer from %s -> %s", src, dst)
 	io.Copy(destination, source)
-	loggo.Info("client end transfer from %s -> %s", src, dst)
+	loggo.Info("transfer client end transfer from %s -> %s", src, dst)
 }
