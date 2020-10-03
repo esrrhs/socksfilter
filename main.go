@@ -15,7 +15,7 @@ import (
 
 var listen = flag.String("l", ":1080", "listen addr")
 var servers = flag.String("s", "server1 server2 server3", "server addr")
-var userand = flag.Bool("rand", true, "select rand server addr")
+var sel = flag.String("select", "robin", "select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all")
 var skip = flag.String("skip", "CN", "skip country")
 var filename = flag.String("file", "GeoLite2-Country.mmdb", "ip file")
 var loglevel = flag.String("loglevel", "info", "log level")
@@ -26,7 +26,7 @@ func main() {
 
 	flag.Parse()
 
-	if *servers == "server1 server2 server3" {
+	if *servers == "" || *servers == "server1 server2 server3" {
 		fmt.Print("need servers\n")
 		flag.Usage()
 		return
@@ -134,51 +134,91 @@ func process(conn *net.TCPConn) {
 	}
 }
 
+func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr, server string) bool {
+
+	tcpaddrProxy, err := net.ResolveTCPAddr("tcp", server)
+	if err != nil {
+		loggo.Info("process_proxy_server tcp ResolveTCPAddr fail: %s %s", server, err.Error())
+		return false
+	}
+
+	proxyconn, err := net.DialTCP("tcp", nil, tcpaddrProxy)
+	if err != nil {
+		loggo.Info("process_proxy_server tcp DialTCP fail: %s %s", targetAddr, err.Error())
+		return false
+	}
+
+	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
+
+	err = network.Sock5Handshake(proxyconn, 1000, "", "")
+	if err != nil {
+		loggo.Info("process_proxy_server Sock5Handshake fail: %s %s", targetAddr, err.Error())
+		return false
+	}
+
+	err = network.Sock5SetRequest(proxyconn, tcpaddrTarget.IP.String(), tcpaddrTarget.Port, 1000)
+	if err != nil {
+		loggo.Info("process_proxy_server Sock5SetRequest fail: %s %s", targetAddr, err.Error())
+		return false
+	}
+
+	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
+
+	go transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
+	go transfer(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String())
+
+	return true
+}
+
 func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr) {
 
 	ss := strings.Fields(*servers)
-	if *userand {
+	if len(ss) <= 0 {
+		loggo.Error("process_proxy no servers fail: %s", targetAddr)
+		return
+	}
+	if *sel == "robin" {
+		for _, server := range ss {
+			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+				return
+			}
+		}
+	} else if *sel == "rand" {
 		rand.Shuffle(len(ss), func(i, j int) {
 			ss[i], ss[j] = ss[j], ss[i]
 		})
+		for _, server := range ss {
+			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+				return
+			}
+		}
+	} else if *sel == "hash_by_dst_ip" {
+		hash := int(common.HashString(tcpaddrTarget.IP.String()))
+		for i := 0; i < len(ss); i++ {
+			server := ss[(hash+i)%len(ss)]
+			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+				return
+			}
+		}
+	} else if *sel == "hash_by_src_ip" {
+		hash := int(common.HashString(conn.RemoteAddr().(*net.TCPAddr).IP.String()))
+		for i := 0; i < len(ss); i++ {
+			server := ss[(hash+i)%len(ss)]
+			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+				return
+			}
+		}
+	} else if *sel == "hash_all" {
+		hash := int(common.HashString(conn.RemoteAddr().String() + "-" + tcpaddrTarget.String()))
+		for i := 0; i < len(ss); i++ {
+			server := ss[(hash+i)%len(ss)]
+			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+				return
+			}
+		}
+	} else {
+		loggo.Error("process_proxy select type error: %s", *sel)
 	}
-
-	for _, server := range ss {
-
-		tcpaddrProxy, err := net.ResolveTCPAddr("tcp", server)
-		if err != nil {
-			loggo.Info("process_proxy tcp ResolveTCPAddr fail: %s %s", server, err.Error())
-			continue
-		}
-
-		proxyconn, err := net.DialTCP("tcp", nil, tcpaddrProxy)
-		if err != nil {
-			loggo.Info("process_proxy tcp DialTCP fail: %s %s", targetAddr, err.Error())
-			continue
-		}
-
-		tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
-
-		err = network.Sock5Handshake(proxyconn, 1000, "", "")
-		if err != nil {
-			loggo.Info("process_proxy Sock5Handshake fail: %s %s", targetAddr, err.Error())
-			continue
-		}
-
-		err = network.Sock5SetRequest(proxyconn, tcpaddrTarget.IP.String(), tcpaddrTarget.Port, 1000)
-		if err != nil {
-			loggo.Info("process_proxy Sock5SetRequest fail: %s %s", targetAddr, err.Error())
-			continue
-		}
-
-		loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
-
-		go transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
-		go transfer(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String())
-
-		return
-	}
-
 	loggo.Info("process_proxy no valid servers fail: %s", *servers)
 }
 
