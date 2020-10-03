@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/esrrhs/go-engine/src/common"
 	"github.com/esrrhs/go-engine/src/geoip"
+	"github.com/esrrhs/go-engine/src/group"
 	"github.com/esrrhs/go-engine/src/loggo"
 	"github.com/esrrhs/go-engine/src/network"
 	"io"
@@ -150,13 +151,13 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *n
 
 	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
 
-	err = network.Sock5Handshake(proxyconn, 1000, "", "")
+	err = network.Sock5Handshake(proxyconn, 0, "", "")
 	if err != nil {
 		loggo.Info("process_proxy_server Sock5Handshake fail: %s %s", targetAddr, err.Error())
 		return false
 	}
 
-	err = network.Sock5SetRequest(proxyconn, tcpaddrTarget.IP.String(), tcpaddrTarget.Port, 1000)
+	err = network.Sock5SetRequest(proxyconn, tcpaddrTarget.IP.String(), tcpaddrTarget.Port, 0)
 	if err != nil {
 		loggo.Info("process_proxy_server Sock5SetRequest fail: %s %s", targetAddr, err.Error())
 		return false
@@ -164,8 +165,20 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *n
 
 	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
-	go transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
-	go transfer(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String())
+	wg := group.NewGroup("proxy", nil, func() {
+		conn.Close()
+		proxyconn.Close()
+	})
+
+	wg.Go("transfer", func() error {
+		return transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
+	})
+
+	wg.Go("transfer", func() error {
+		return transfer(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String())
+	})
+
+	wg.Wait()
 
 	return true
 }
@@ -234,17 +247,25 @@ func process_direct(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCP
 
 	loggo.Info("process_direct client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
 
-	go transfer(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String())
-	go transfer(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String())
+	wg := group.NewGroup("direct", nil, func() {
+		conn.Close()
+		targetconn.Close()
+	})
+
+	wg.Go("transfer", func() error {
+		return transfer(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String())
+	})
+	wg.Go("transfer", func() error {
+		return transfer(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String())
+	})
+
+	wg.Wait()
 }
 
-func transfer(destination io.WriteCloser, source io.ReadCloser, dst string, src string) {
+func transfer(destination io.WriteCloser, source io.ReadCloser, dst string, src string) error {
 
-	defer common.CrashLog()
-
-	defer destination.Close()
-	defer source.Close()
 	loggo.Info("transfer client begin transfer from %s -> %s", src, dst)
 	n, err := io.Copy(destination, source)
 	loggo.Info("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
+	return err
 }
