@@ -11,7 +11,27 @@ socks5过滤器
 ```
 # ./socksfilter -s "yourserver1:1080 yourserver2:1080 yourserver3:1080"
 ```
-* 使用docker
+* 也可以使用docker
 ```
 # docker run --name socksfilter -d --restart=always --network host esrrhs/socksfilter ./socksfilter -s "yourserver1:1080 yourserver2:1080 yourserver3:1080"
+```
+* 更多命令参考-h
+```
+Usage of ./socksfilter:
+  -file string
+    	ip file (default "GeoLite2-Country.mmdb")
+  -l string
+    	listen addr (default ":1080")
+  -loglevel string
+    	log level (default "info")
+  -nolog int
+    	write log file
+  -noprint int
+    	print stdout
+  -s string
+    	server addr (default "server1 server2 server3")
+  -select string
+    	select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all (default "robin")
+  -skip string
+    	skip country (default "CN")
 ```
