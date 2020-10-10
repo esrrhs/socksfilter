@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/esrrhs/go-engine/src/common"
 	"github.com/esrrhs/go-engine/src/geoip"
-	"github.com/esrrhs/go-engine/src/group"
 	"github.com/esrrhs/go-engine/src/loggo"
 	"github.com/esrrhs/go-engine/src/network"
 	"io"
@@ -165,17 +164,13 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *n
 
 	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
-	wg := group.NewGroup("proxy", nil, nil)
+	errCh := make(chan error, 2)
+	go proxy(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String(), errCh)
+	go proxy(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String(), errCh)
 
-	wg.Go("transfer", func() error {
-		return transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
-	})
-
-	wg.Go("transfer", func() error {
-		return transfer(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String())
-	})
-
-	wg.Wait()
+	for i := 0; i < 2; i++ {
+		<-errCh
+	}
 
 	conn.Close()
 	proxyconn.Close()
@@ -247,48 +242,21 @@ func process_direct(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCP
 
 	loggo.Info("process_direct client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
 
-	wg := group.NewGroup("direct", nil, nil)
+	errCh := make(chan error, 2)
+	go proxy(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String(), errCh)
+	go proxy(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String(), errCh)
 
-	wg.Go("transfer", func() error {
-		return transfer(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String())
-	})
-	wg.Go("transfer", func() error {
-		return transfer(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String())
-	})
-
-	wg.Wait()
+	for i := 0; i < 2; i++ {
+		<-errCh
+	}
 
 	conn.Close()
 	targetconn.Close()
 }
 
-func transfer(destination io.WriteCloser, source io.ReadCloser, dst string, src string) error {
-
+func proxy(destination io.Writer, source io.Reader, dst string, src string, errCh chan error) {
 	loggo.Info("transfer client begin transfer from %s -> %s", src, dst)
-	n := 0
-	var err error
-	buf := make([]byte, 32*1024)
-	for {
-		nr, er := source.Read(buf)
-		if nr > 0 {
-			nw, ew := destination.Write(buf[0:nr])
-			if nw > 0 {
-				n += nw
-			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er != nil {
-			err = er
-			break
-		}
-	}
+	n, err := io.Copy(destination, source)
+	errCh <- err
 	loggo.Info("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
-	return nil
 }
