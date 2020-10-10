@@ -165,10 +165,7 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *n
 
 	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
-	wg := group.NewGroup("proxy", nil, func() {
-		conn.Close()
-		proxyconn.Close()
-	})
+	wg := group.NewGroup("proxy", nil, nil)
 
 	wg.Go("transfer", func() error {
 		return transfer(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String())
@@ -179,6 +176,9 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *n
 	})
 
 	wg.Wait()
+
+	conn.Close()
+	proxyconn.Close()
 
 	return true
 }
@@ -290,5 +290,5 @@ func transfer(destination io.WriteCloser, source io.ReadCloser, dst string, src 
 		}
 	}
 	loggo.Info("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
-	return err
+	return nil
 }
