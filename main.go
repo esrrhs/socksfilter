@@ -247,10 +247,7 @@ func process_direct(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCP
 
 	loggo.Info("process_direct client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
 
-	wg := group.NewGroup("direct", nil, func() {
-		conn.Close()
-		targetconn.Close()
-	})
+	wg := group.NewGroup("direct", nil, nil)
 
 	wg.Go("transfer", func() error {
 		return transfer(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String())
@@ -260,12 +257,38 @@ func process_direct(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCP
 	})
 
 	wg.Wait()
+
+	conn.Close()
+	targetconn.Close()
 }
 
 func transfer(destination io.WriteCloser, source io.ReadCloser, dst string, src string) error {
 
 	loggo.Info("transfer client begin transfer from %s -> %s", src, dst)
-	n, err := io.Copy(destination, source)
+	n := 0
+	var err error
+	buf := make([]byte, 32*1024)
+	for {
+		nr, er := source.Read(buf)
+		if nr > 0 {
+			nw, ew := destination.Write(buf[0:nr])
+			if nw > 0 {
+				n += nw
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			err = er
+			break
+		}
+	}
 	loggo.Info("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
 	return err
 }
