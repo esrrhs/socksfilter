@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -119,22 +120,16 @@ func process(conn *net.TCPConn) {
 		return
 	}
 
-	tcpaddrTarget, err := net.ResolveTCPAddr("tcp", targetAddr)
-	if err != nil {
-		loggo.Info("process tcp ResolveTCPAddr fail: %s %s", targetAddr, err.Error())
-		return
-	}
-
 	loggo.Info("process accept new sock5 conn: %s", targetAddr)
 
 	if need_proxy(targetAddr) {
-		process_proxy(conn, targetAddr, tcpaddrTarget)
+		process_proxy(conn, targetAddr)
 	} else {
-		process_direct(conn, targetAddr, tcpaddrTarget)
+		process_direct(conn, targetAddr)
 	}
 }
 
-func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr, server string) bool {
+func process_proxy_server(conn *net.TCPConn, targetAddr string, server string) bool {
 
 	tcpaddrProxy, err := net.ResolveTCPAddr("tcp", server)
 	if err != nil {
@@ -156,7 +151,19 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *n
 		return false
 	}
 
-	err = network.Sock5SetRequest(proxyconn, tcpaddrTarget.IP.String(), tcpaddrTarget.Port, 0)
+	dsthost, dstportstr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		loggo.Info("process_proxy_server SplitHostPort error: %s", err)
+		return false
+	}
+
+	dstport, err := strconv.Atoi(dstportstr)
+	if err != nil {
+		loggo.Info("process_proxy_server Atoi error: %s", err)
+		return false
+	}
+
+	err = network.Sock5SetRequest(proxyconn, dsthost, dstport, 0)
 	if err != nil {
 		loggo.Info("process_proxy_server Sock5SetRequest fail: %s %s", targetAddr, err.Error())
 		return false
@@ -178,7 +185,7 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, tcpaddrTarget *n
 	return true
 }
 
-func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr) {
+func process_proxy(conn *net.TCPConn, targetAddr string) {
 
 	ss := strings.Fields(*servers)
 	if len(ss) <= 0 {
@@ -187,7 +194,7 @@ func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPA
 	}
 	if *sel == "robin" {
 		for _, server := range ss {
-			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+			if process_proxy_server(conn, targetAddr, server) {
 				return
 			}
 		}
@@ -196,15 +203,20 @@ func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPA
 			ss[i], ss[j] = ss[j], ss[i]
 		})
 		for _, server := range ss {
-			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+			if process_proxy_server(conn, targetAddr, server) {
 				return
 			}
 		}
 	} else if *sel == "hash_by_dst_ip" {
-		hash := int(common.HashString(tcpaddrTarget.IP.String()))
+		dsthost, _, err := net.SplitHostPort(targetAddr)
+		if err != nil {
+			loggo.Info("process_proxy SplitHostPort error: %s", err)
+			return
+		}
+		hash := int(common.HashString(dsthost))
 		for i := 0; i < len(ss); i++ {
 			server := ss[(hash+i)%len(ss)]
-			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+			if process_proxy_server(conn, targetAddr, server) {
 				return
 			}
 		}
@@ -212,15 +224,15 @@ func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPA
 		hash := int(common.HashString(conn.RemoteAddr().(*net.TCPAddr).IP.String()))
 		for i := 0; i < len(ss); i++ {
 			server := ss[(hash+i)%len(ss)]
-			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+			if process_proxy_server(conn, targetAddr, server) {
 				return
 			}
 		}
 	} else if *sel == "hash_all" {
-		hash := int(common.HashString(conn.RemoteAddr().String() + "-" + tcpaddrTarget.String()))
+		hash := int(common.HashString(conn.RemoteAddr().String() + "-" + targetAddr))
 		for i := 0; i < len(ss); i++ {
 			server := ss[(hash+i)%len(ss)]
-			if process_proxy_server(conn, targetAddr, tcpaddrTarget, server) {
+			if process_proxy_server(conn, targetAddr, server) {
 				return
 			}
 		}
@@ -230,7 +242,13 @@ func process_proxy(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPA
 	loggo.Info("process_proxy no valid servers fail: %s", *servers)
 }
 
-func process_direct(conn *net.TCPConn, targetAddr string, tcpaddrTarget *net.TCPAddr) {
+func process_direct(conn *net.TCPConn, targetAddr string) {
+
+	tcpaddrTarget, err := net.ResolveTCPAddr("tcp", targetAddr)
+	if err != nil {
+		loggo.Info("process_direct tcp ResolveTCPAddr fail: %s %s", targetAddr, err.Error())
+		return
+	}
 
 	targetconn, err := net.DialTCP("tcp", nil, tcpaddrTarget)
 	if err != nil {
