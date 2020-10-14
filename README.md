@@ -1,4 +1,13 @@
 # socksfilter
+
+[<img src="https://img.shields.io/github/license/esrrhs/socksfilter">](https://github.com/esrrhs/socksfilter)
+[<img src="https://img.shields.io/github/languages/top/esrrhs/socksfilter">](https://github.com/esrrhs/socksfilter)
+[![Go Report Card](https://goreportcard.com/badge/github.com/esrrhs/socksfilter)](https://goreportcard.com/report/github.com/esrrhs/socksfilter)
+[<img src="https://img.shields.io/github/v/release/esrrhs/socksfilter">](https://github.com/esrrhs/socksfilter/releases)
+[<img src="https://img.shields.io/github/downloads/esrrhs/socksfilter/total">](https://github.com/esrrhs/socksfilter/releases)
+[<img src="https://img.shields.io/docker/pulls/esrrhs/socksfilter">](https://hub.docker.com/repository/docker/esrrhs/socksfilter)
+[<img src="https://img.shields.io/github/workflow/status/esrrhs/socksfilter/Go">](https://github.com/esrrhs/socksfilter/actions)
+
 socks5过滤器
 
 # 特性
