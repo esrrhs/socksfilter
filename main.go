@@ -4,9 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"github.com/esrrhs/gohome/common"
+	"github.com/esrrhs/gohome/geoip"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/network"
-	"github.com/esrrhs/pingtunnel"
 	"io"
 	"math/rand"
 	"net"
@@ -46,7 +46,7 @@ func main() {
 	})
 	loggo.Info("start...")
 
-	err := pingtunnel.LoadGeoDB(*filename)
+	err := geoip.Load(*filename)
 	if err != nil {
 		loggo.Error("Load Sock5 ip file ERROR: %s", err.Error())
 		return
@@ -83,7 +83,7 @@ func need_proxy(addr string) bool {
 		return false
 	}
 
-	ret, err := pingtunnel.GetCountryIsoCode(taddr.IP.String())
+	ret, err := geoip.GetCountryIsoCode(taddr.IP.String())
 	if err != nil {
 		return false
 	}
