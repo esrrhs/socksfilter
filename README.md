@@ -6,7 +6,7 @@
 [<img src="https://img.shields.io/github/v/release/esrrhs/socksfilter">](https://github.com/esrrhs/socksfilter/releases)
 [<img src="https://img.shields.io/github/downloads/esrrhs/socksfilter/total">](https://github.com/esrrhs/socksfilter/releases)
 [<img src="https://img.shields.io/docker/pulls/esrrhs/socksfilter">](https://hub.docker.com/repository/docker/esrrhs/socksfilter)
-[<img src="https://img.shields.io/github/workflow/status/esrrhs/socksfilter/Go">](https://github.com/esrrhs/socksfilter/actions)
+[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/socksfilter/go.yml?branch=master">](https://github.com/esrrhs/socksfilter/actions)
 
 socks5过滤器
 

@@ -3,10 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/esrrhs/go-engine/src/common"
-	"github.com/esrrhs/go-engine/src/geoip"
-	"github.com/esrrhs/go-engine/src/loggo"
-	"github.com/esrrhs/go-engine/src/network"
+	"github.com/esrrhs/gohome/common"
+	"github.com/esrrhs/gohome/loggo"
+	"github.com/esrrhs/gohome/network"
+	"github.com/esrrhs/pingtunnel"
 	"io"
 	"math/rand"
 	"net"
@@ -46,7 +46,7 @@ func main() {
 	})
 	loggo.Info("start...")
 
-	err := geoip.Load(*filename)
+	err := pingtunnel.LoadGeoDB(*filename)
 	if err != nil {
 		loggo.Error("Load Sock5 ip file ERROR: %s", err.Error())
 		return
@@ -83,7 +83,7 @@ func need_proxy(addr string) bool {
 		return false
 	}
 
-	ret, err := geoip.GetCountryIsoCode(taddr.IP.String())
+	ret, err := pingtunnel.GetCountryIsoCode(taddr.IP.String())
 	if err != nil {
 		return false
 	}
