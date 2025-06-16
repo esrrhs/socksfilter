@@ -4,9 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"github.com/esrrhs/gohome/common"
-	"github.com/esrrhs/gohome/geoip"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/network"
+	"github.com/esrrhs/gohome/thirdparty"
 	"io"
 	"math/rand"
 	"net"
@@ -46,7 +46,7 @@ func main() {
 	})
 	loggo.Info("start...")
 
-	err := geoip.Load(*filename)
+	err := thirdparty.LoadGeoip2(*filename)
 	if err != nil {
 		loggo.Error("Load Sock5 ip file ERROR: %s", err.Error())
 		return
@@ -78,18 +78,29 @@ func main() {
 
 func need_proxy(addr string) bool {
 
-	taddr, err := net.ResolveTCPAddr("tcp", addr)
+	taddr, err := common.ResolveDomainToIP(addr)
 	if err != nil {
+		loggo.Error("get_ip error: %s", err)
 		return false
 	}
 
-	ret, err := geoip.GetCountryIsoCode(taddr.IP.String())
+	loggo.Info("need_proxy ResolveDomainToIP: %s %s", addr, taddr)
+
+	if common.IsPrivateIP(taddr) {
+		loggo.Info("private ip direct: %s %s", addr, taddr)
+		return false
+	}
+
+	ret, err := thirdparty.GetGeoipCountryIsoCode(taddr)
 	if err != nil {
 		return false
 	}
 	if len(ret) <= 0 {
+		loggo.Info("get country empty direct: %s %s", addr, taddr)
 		return false
 	}
+
+	loggo.Info("need_proxy GetGeoipCountryIsoCode: %s %s %s", addr, taddr, ret)
 
 	return ret != *skip
 }
