@@ -1,10 +1,14 @@
 FROM golang AS build-env
 
-RUN GO111MODULE=off go get -u github.com/esrrhs/socksfilter
-RUN GO111MODULE=off go get -u github.com/esrrhs/socksfilter/...
-RUN GO111MODULE=off go install github.com/esrrhs/socksfilter
+WORKDIR /app
+
+COPY go.* ./
+RUN go mod download
+COPY . ./
+RUN go mod tidy
+RUN go build -v -o socksfilter
 
 FROM debian
-COPY --from=build-env /go/bin/socksfilter .
+COPY --from=build-env /app/socksfilter .
 COPY GeoLite2-Country.mmdb .
 WORKDIR ./
