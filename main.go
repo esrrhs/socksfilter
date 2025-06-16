@@ -77,8 +77,13 @@ func main() {
 }
 
 func need_proxy(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		loggo.Error("get_ip error: %s", err)
+		return false
+	}
 
-	taddr, err := common.ResolveDomainToIP(addr)
+	taddr, err := common.ResolveDomainToIP(host)
 	if err != nil {
 		loggo.Error("get_ip error: %s", err)
 		return false
