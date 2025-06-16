@@ -4,7 +4,7 @@ go 1.23.0
 
 toolchain go1.24.1
 
-require github.com/esrrhs/gohome v0.0.0-20250616171024-c1aa0833b1a7
+require github.com/esrrhs/gohome v0.0.0-20250616172059-8fa4e4c2140b
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8 // indirect
