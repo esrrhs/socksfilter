@@ -28,6 +28,8 @@ var cache_expire = flag.Int("cache_expire", 7*24*3600, "cache expire seconds for
 var loglevel = flag.String("loglevel", "info", "log level")
 var nolog = flag.Int("nolog", 0, "write log file")
 var noprint = flag.Int("noprint", 0, "print stdout")
+var username = flag.String("username", "", "username")
+var password = flag.String("password", "", "password")
 
 var gDnsCache *lru.LRUMultiCache[string, bool]
 
@@ -138,7 +140,7 @@ func process(conn *net.TCPConn) {
 	defer common.CrashLog()
 
 	var err error = nil
-	if err = network.Sock5HandshakeBy(conn, "", ""); err != nil {
+	if err = network.Sock5HandshakeBy(conn, *username, *password); err != nil {
 		loggo.Error("process socks handshake: %s", err)
 		conn.Close()
 		return
