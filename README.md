@@ -11,7 +11,7 @@
 socks5过滤器
 
 # 特性
-* 监听端口（默认1080），对外提供socks5服务
+* 监听端口（默认1080），对外提供socks5服务，支持用户密码
 * 使用阿里云DNS判断目标IP归属所在国家，内置LRU缓存减少查询
 * 根据目标IP所在国家过滤（默认CN），命中直连，非命中走后端socks5 server
 * 后端聚合多个socks5 server，选择方式：遍历（默认）/随机/Hash，同时跳过无效的
@@ -28,6 +28,10 @@ socks5过滤器
 * 更多命令参考-h
 ```
 Usage of ./socksfilter:
+  -cache_expire int
+    	cache expire seconds for dns (default 604800)
+  -cache_size int
+    	cache size for dns (default 10000)
   -file string
     	ip file (default "GeoLite2-Country.mmdb")
   -l string
@@ -38,10 +42,14 @@ Usage of ./socksfilter:
     	write log file
   -noprint int
     	print stdout
+  -password string
+    	password
   -s string
     	server addr (default "server1 server2 server3")
   -select string
     	select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all (default "robin")
   -skip string
     	skip country (default "CN")
+  -username string
+    	username
 ```
