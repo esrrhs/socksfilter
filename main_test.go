@@ -48,3 +48,9 @@ func Test002(t *testing.T) {
 	}
 	fmt.Println("ResolveDomainToIP: ", taddr, time.Now().Sub(begin))
 }
+
+func Test003(t *testing.T) {
+	init_env()
+	fmt.Println("need proxy baidu", need_proxy("www.baidu.com:443"))
+	fmt.Println("need proxy google", need_proxy("www.google.com:443"))
+}

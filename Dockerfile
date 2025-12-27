@@ -11,4 +11,5 @@ RUN go build -v -o socksfilter
 FROM debian
 COPY --from=build-env /app/socksfilter .
 COPY GeoLite2-Country.mmdb .
+COPY accelerated-domains.china.conf .
 WORKDIR ./

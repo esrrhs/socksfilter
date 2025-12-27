@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"runtime"
@@ -33,6 +34,8 @@ var password = flag.String("password", "", "password")
 
 var gDnsCache *lru.LRUMultiCache[string, string]
 
+var gChinaDomains map[string]bool
+
 func main() {
 
 	flag.Parse()
@@ -56,11 +59,7 @@ func main() {
 	})
 	loggo.Info("start...")
 
-	err := thirdparty.LoadGeoip2(*filename)
-	if err != nil {
-		loggo.Error("Load Sock5 ip file ERROR: %s", err.Error())
-		return
-	}
+	init_env()
 
 	tcpaddr, err := net.ResolveTCPAddr("tcp", *listen)
 	if err != nil {
@@ -75,12 +74,6 @@ func main() {
 	}
 	loggo.Info("listen ok %s", tcpaddr.String())
 
-	gDnsCache = lru.NewLRUMultiCache[string, string](
-		runtime.NumCPU(),
-		*cache_size,
-		time.Duration(*cache_expire)*time.Second,
-	)
-
 	for {
 		conn, err := tcplistenConn.AcceptTCP()
 		if err != nil {
@@ -92,10 +85,50 @@ func main() {
 	}
 }
 
-func need_proxy(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
+func init_env() {
+	err := thirdparty.LoadGeoip2(*filename)
 	if err != nil {
-		loggo.Error("get_ip error: %s", err)
+		loggo.Error("Load Sock5 ip file ERROR: %s", err.Error())
+		return
+	}
+
+	gDnsCache = lru.NewLRUMultiCache[string, string](
+		runtime.NumCPU(),
+		*cache_size,
+		time.Duration(*cache_expire)*time.Second,
+	)
+
+	load_china_domains()
+}
+
+func load_china_domains() {
+	// 读取accelerated-domains.china.conf
+	gChinaDomains = make(map[string]bool)
+	lines, err := ioutil.ReadFile("accelerated-domains.china.conf")
+	if err != nil {
+		loggo.Error("load_china_domains read file error: %s", err)
+		return
+	}
+	for _, line := range strings.Split(string(lines), "\n") {
+		line = strings.TrimSpace(line)
+		params := strings.Split(line, "/")
+		if len(params) >= 3 && params[0] == "server=" {
+			host := params[1]
+			gChinaDomains[host] = true
+		}
+	}
+	loggo.Info("load_china_domains load ok: %d", len(gChinaDomains))
+}
+
+func need_proxy(addr string) bool {
+	host, err := common.GetRootDomain(addr)
+	if err != nil {
+		loggo.Error("GetRootDomain error: %s", err)
+		return false
+	}
+
+	if ok, find := gChinaDomains[host]; find && ok {
+		loggo.Info("china domain direct: %s %s", host, addr)
 		return false
 	}
 
@@ -109,14 +142,14 @@ func need_proxy(addr string) bool {
 	if find {
 		loggo.Info("need_proxy cache hit: %s %v", host, cache_addr)
 		taddr = cache_addr
+	} else {
+		taddr, err = common.ResolveDomainToIP(host)
+		if err != nil {
+			loggo.Error("get_ip error: %s", err)
+			return false
+		}
+		gDnsCache.Set(host, taddr)
 	}
-
-	taddr, err = common.ResolveDomainToIP(host)
-	if err != nil {
-		loggo.Error("get_ip error: %s", err)
-		return false
-	}
-	gDnsCache.Set(host, taddr)
 
 	loggo.Info("need_proxy ResolveDomainToIP: %s %s", addr, taddr)
 

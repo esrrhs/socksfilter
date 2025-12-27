@@ -16,6 +16,8 @@ github.com/esrrhs/gohome v0.0.0-20251227024859-65a289e5e7d1 h1:V/T61HnwqxXKbO3dy
 github.com/esrrhs/gohome v0.0.0-20251227024859-65a289e5e7d1/go.mod h1:F7tzFcfiZDzo2GnbW4zor/6ioEM8x7quqQuSMIymIXQ=
 github.com/esrrhs/gohome v0.0.0-20251227025824-7932bc6ee930 h1:PiQIEiNbuHonM4Pxrk3ExuKsGFEJXghiG0kQXf+deto=
 github.com/esrrhs/gohome v0.0.0-20251227025824-7932bc6ee930/go.mod h1:F7tzFcfiZDzo2GnbW4zor/6ioEM8x7quqQuSMIymIXQ=
+github.com/esrrhs/gohome v0.0.0-20251227035233-3f8169d8cc10 h1:YHGYM6HQokGSe2ttrz7Web0dRYb5c9TLSU3rjDzXsu8=
+github.com/esrrhs/gohome v0.0.0-20251227035233-3f8169d8cc10/go.mod h1:F7tzFcfiZDzo2GnbW4zor/6ioEM8x7quqQuSMIymIXQ=
 github.com/go-task/slim-sprig/v3 v3.0.0 h1:sUs3vkvUymDpBKi3qH1YSqBQk9+9D/8M2mN1vB6EwHI=
 github.com/go-task/slim-sprig/v3 v3.0.0/go.mod h1:W848ghGpv3Qj3dhTPRyJypKRiqCdHZiAzKg9hl15HA8=
 github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
