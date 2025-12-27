@@ -25,7 +25,7 @@ var sel = flag.String("select", "robin", "select server robin/rand/hash_by_dst_i
 var skip = flag.String("skip", "CN", "skip country")
 var filename = flag.String("file", "GeoLite2-Country.mmdb", "ip file")
 var cache_size = flag.Int("cache_size", 1000, "cache size for dns")
-var cache_expire = flag.Int("cache_expire", 0, "cache expire seconds for dns")
+var cache_expire = flag.Int("cache_expire", 3600, "cache expire seconds for dns")
 var loglevel = flag.String("loglevel", "info", "log level")
 var nolog = flag.Int("nolog", 0, "write log file")
 var noprint = flag.Int("noprint", 0, "print stdout")
@@ -121,34 +121,57 @@ func load_china_domains() {
 }
 
 func need_proxy(addr string) bool {
-	host, err := common.GetRootDomain(addr)
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		loggo.Error("SplitHostPort error: %s", err)
+		return false
+	}
+
+	root_host, err := common.GetRootDomain(addr)
 	if err != nil {
 		loggo.Error("GetRootDomain error: %s", err)
 		return false
 	}
 
-	if ok, find := gChinaDomains[host]; find && ok {
-		loggo.Info("china domain direct: %s %s", host, addr)
+	if ok, find := gChinaDomains[root_host]; find && ok {
+		loggo.Info("china domain direct: %s %s", root_host, addr)
 		return false
 	}
 
-	if common.IsValidIP(host) {
-		loggo.Info("just ip %s %s", host, addr)
+	if common.IsValidIP(root_host) {
+		loggo.Info("just ip %s %s", root_host, addr)
 		return false
 	}
 
 	var taddr string
+	// 同时查询
 	cache_addr, find := gDnsCache.Get(host)
-	if find {
-		loggo.Info("need_proxy cache hit: %s %v", host, cache_addr)
-		taddr = cache_addr
-	} else {
-		taddr, err = common.ResolveDomainToIP(host)
-		if err != nil {
-			loggo.Error("get_ip error: %s", err)
-			return false
+	root_cache_addr, root_find := gDnsCache.Get(root_host)
+	if find || root_find {
+		if find {
+			loggo.Info("need_proxy cache hit: %s %v", host, cache_addr)
+			taddr = cache_addr
+		} else {
+			loggo.Info("need_proxy cache root hit: %s %v", root_host, root_cache_addr)
+			taddr = root_cache_addr
 		}
-		gDnsCache.Set(host, taddr)
+	} else {
+		// 优先root_host解析
+		taddr, err = common.ResolveDomainToIP(root_host)
+		if err == nil {
+			gDnsCache.Set(root_host, taddr)
+			loggo.Info("need_proxy cache root set: %s %s size %v", root_host, taddr, gDnsCache.Size())
+		} else {
+			loggo.Error("need_proxy ResolveDomainToIP root error: %s %s", root_host, err)
+			// 有可能是根域名没有解析，这时候使用原始host继续
+			taddr, err = common.ResolveDomainToIP(host)
+			if err != nil {
+				loggo.Error("need_proxy ResolveDomainToIP error: %s %s", host, err)
+				return false
+			}
+			gDnsCache.Set(host, taddr)
+			loggo.Info("need_proxy cache set: %s %s size %v", host, taddr, gDnsCache.Size())
+		}
 	}
 
 	loggo.Info("need_proxy ResolveDomainToIP: %s %s", addr, taddr)
@@ -353,8 +376,8 @@ func process_direct(conn *net.TCPConn, targetAddr string) {
 }
 
 func proxy(destination io.Writer, source io.Reader, dst string, src string, errCh chan error) {
-	loggo.Info("transfer client begin transfer from %s -> %s", src, dst)
+	loggo.Debug("transfer client begin transfer from %s -> %s", src, dst)
 	n, err := io.Copy(destination, source)
 	errCh <- err
-	loggo.Info("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
+	loggo.Debug("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
 }
