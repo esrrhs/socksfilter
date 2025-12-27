@@ -138,43 +138,43 @@ func need_proxy(addr string) bool {
 		return false
 	}
 
-	if common.IsValidIP(root_host) {
-		loggo.Info("just ip %s %s", root_host, addr)
-		return false
-	}
-
 	var taddr string
-	// 同时查询
-	cache_addr, find := gDnsCache.Get(host)
-	root_cache_addr, root_find := gDnsCache.Get(root_host)
-	if find || root_find {
-		if find {
-			loggo.Info("need_proxy cache hit: %s %v", host, cache_addr)
-			taddr = cache_addr
-		} else {
-			loggo.Info("need_proxy cache root hit: %s %v", root_host, root_cache_addr)
-			taddr = root_cache_addr
-		}
+	if common.IsValidIP(root_host) {
+		taddr = root_host
+		loggo.Info("need_proxy valid ip: %s %s", addr, taddr)
 	} else {
-		// 优先root_host解析
-		taddr, err = common.ResolveDomainToIP(root_host)
-		if err == nil {
-			gDnsCache.Set(root_host, taddr)
-			loggo.Info("need_proxy cache root set: %s %s size %v", root_host, taddr, gDnsCache.Size())
-		} else {
-			loggo.Error("need_proxy ResolveDomainToIP root error: %s %s", root_host, err)
-			// 有可能是根域名没有解析，这时候使用原始host继续
-			taddr, err = common.ResolveDomainToIP(host)
-			if err != nil {
-				loggo.Error("need_proxy ResolveDomainToIP error: %s %s", host, err)
-				return false
+		// 同时查询
+		cache_addr, find := gDnsCache.Get(host)
+		root_cache_addr, root_find := gDnsCache.Get(root_host)
+		if find || root_find {
+			if find {
+				loggo.Info("need_proxy cache hit: %s %v", host, cache_addr)
+				taddr = cache_addr
+			} else {
+				loggo.Info("need_proxy cache root hit: %s %v", root_host, root_cache_addr)
+				taddr = root_cache_addr
 			}
-			gDnsCache.Set(host, taddr)
-			loggo.Info("need_proxy cache set: %s %s size %v", host, taddr, gDnsCache.Size())
+		} else {
+			// 优先root_host解析
+			taddr, err = common.ResolveDomainToIP(root_host)
+			if err == nil {
+				gDnsCache.Set(root_host, taddr)
+				loggo.Info("need_proxy cache root set: %s %s size %v", root_host, taddr, gDnsCache.Size())
+			} else {
+				loggo.Error("need_proxy ResolveDomainToIP root error: %s %s", root_host, err)
+				// 有可能是根域名没有解析，这时候使用原始host继续
+				taddr, err = common.ResolveDomainToIP(host)
+				if err != nil {
+					loggo.Error("need_proxy ResolveDomainToIP error: %s %s", host, err)
+					return false
+				}
+				gDnsCache.Set(host, taddr)
+				loggo.Info("need_proxy cache set: %s %s size %v", host, taddr, gDnsCache.Size())
+			}
 		}
-	}
 
-	loggo.Info("need_proxy ResolveDomainToIP: %s %s", addr, taddr)
+		loggo.Info("need_proxy ResolveDomainToIP: %s %s", addr, taddr)
+	}
 
 	if common.IsPrivateIP(taddr) {
 		loggo.Info("private ip direct: %s %s", addr, taddr)
