@@ -2,7 +2,7 @@ module github.com/esrrhs/socksfilter
 
 go 1.24.9
 
-require github.com/esrrhs/gohome v0.0.0-20251213010607-0833baa19d8c
+require github.com/esrrhs/gohome v0.0.0-20251227025824-7932bc6ee930
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8 // indirect

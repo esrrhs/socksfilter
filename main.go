@@ -23,15 +23,15 @@ var servers = flag.String("s", "server1 server2 server3", "server addr")
 var sel = flag.String("select", "robin", "select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all")
 var skip = flag.String("skip", "CN", "skip country")
 var filename = flag.String("file", "GeoLite2-Country.mmdb", "ip file")
-var cache_size = flag.Int("cache_size", 10000, "cache size for dns")
-var cache_expire = flag.Int("cache_expire", 7*24*3600, "cache expire seconds for dns")
+var cache_size = flag.Int("cache_size", 1000, "cache size for dns")
+var cache_expire = flag.Int("cache_expire", 0, "cache expire seconds for dns")
 var loglevel = flag.String("loglevel", "info", "log level")
 var nolog = flag.Int("nolog", 0, "write log file")
 var noprint = flag.Int("noprint", 0, "print stdout")
 var username = flag.String("username", "", "username")
 var password = flag.String("password", "", "password")
 
-var gDnsCache *lru.LRUMultiCache[string, bool]
+var gDnsCache *lru.LRUMultiCache[string, string]
 
 func main() {
 
@@ -75,7 +75,7 @@ func main() {
 	}
 	loggo.Info("listen ok %s", tcpaddr.String())
 
-	gDnsCache = lru.NewLRUMultiCache[string, bool](
+	gDnsCache = lru.NewLRUMultiCache[string, string](
 		runtime.NumCPU(),
 		*cache_size,
 		time.Duration(*cache_expire)*time.Second,
@@ -99,17 +99,24 @@ func need_proxy(addr string) bool {
 		return false
 	}
 
-	cache_skip, find := gDnsCache.Get(host)
-	if find {
-		loggo.Info("need_proxy cache hit: %s %v", host, cache_skip)
-		return cache_skip
+	if common.IsValidIP(host) {
+		loggo.Info("just ip %s %s", host, addr)
+		return false
 	}
 
-	taddr, err := common.ResolveDomainToIP(host)
+	var taddr string
+	cache_addr, find := gDnsCache.Get(host)
+	if find {
+		loggo.Info("need_proxy cache hit: %s %v", host, cache_addr)
+		taddr = cache_addr
+	}
+
+	taddr, err = common.ResolveDomainToIP(host)
 	if err != nil {
 		loggo.Error("get_ip error: %s", err)
 		return false
 	}
+	gDnsCache.Set(host, taddr)
 
 	loggo.Info("need_proxy ResolveDomainToIP: %s %s", addr, taddr)
 
@@ -130,7 +137,6 @@ func need_proxy(addr string) bool {
 	loggo.Info("need_proxy GetGeoipCountryIsoCode: %s %s %s", addr, taddr, ret)
 
 	need_skip := ret != *skip
-	gDnsCache.Set(host, need_skip)
 
 	return need_skip
 }

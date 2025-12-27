@@ -10,6 +10,12 @@ github.com/envoyproxy/go-control-plane v0.9.4/go.mod h1:6rpuAdCZL397s3pYoYcLgu1m
 github.com/envoyproxy/protoc-gen-validate v0.1.0/go.mod h1:iSmxcyjqTsJpI2R4NaDN7+kN2VEUnK/pcBlmesArF7c=
 github.com/esrrhs/gohome v0.0.0-20251213010607-0833baa19d8c h1:3kJvuErJUUFAsWuLoqpv+SQ8AmvVXLadvj3B6a0mYqk=
 github.com/esrrhs/gohome v0.0.0-20251213010607-0833baa19d8c/go.mod h1:F7tzFcfiZDzo2GnbW4zor/6ioEM8x7quqQuSMIymIXQ=
+github.com/esrrhs/gohome v0.0.0-20251227013721-8bd21d566261 h1:Dd9SkRn9AwHIryFhqz658JWw8hgaYPzCljFTVpS/tXM=
+github.com/esrrhs/gohome v0.0.0-20251227013721-8bd21d566261/go.mod h1:F7tzFcfiZDzo2GnbW4zor/6ioEM8x7quqQuSMIymIXQ=
+github.com/esrrhs/gohome v0.0.0-20251227024859-65a289e5e7d1 h1:V/T61HnwqxXKbO3dyuigtWf95x5zdZe0VbJkThgvAHU=
+github.com/esrrhs/gohome v0.0.0-20251227024859-65a289e5e7d1/go.mod h1:F7tzFcfiZDzo2GnbW4zor/6ioEM8x7quqQuSMIymIXQ=
+github.com/esrrhs/gohome v0.0.0-20251227025824-7932bc6ee930 h1:PiQIEiNbuHonM4Pxrk3ExuKsGFEJXghiG0kQXf+deto=
+github.com/esrrhs/gohome v0.0.0-20251227025824-7932bc6ee930/go.mod h1:F7tzFcfiZDzo2GnbW4zor/6ioEM8x7quqQuSMIymIXQ=
 github.com/go-task/slim-sprig/v3 v3.0.0 h1:sUs3vkvUymDpBKi3qH1YSqBQk9+9D/8M2mN1vB6EwHI=
 github.com/go-task/slim-sprig/v3 v3.0.0/go.mod h1:W848ghGpv3Qj3dhTPRyJypKRiqCdHZiAzKg9hl15HA8=
 github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
