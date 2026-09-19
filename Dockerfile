@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24-alpine AS build-env
+FROM golang:alpine AS build-env
 
 WORKDIR /app
 
@@ -12,7 +12,7 @@ COPY . ./
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o socksfilter .
 
 # Final stage
-FROM alpine:3.21
+FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates tzdata
 
