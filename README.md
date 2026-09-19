@@ -35,8 +35,28 @@ Listen on port 1080, bypass CN traffic directly, and route non-CN traffic throug
 
 ### Docker
 Run directly using the pre-built Docker image:
+
+**Option 1: Port mapping (recommended for macOS, Windows, Linux)**
 ```bash
-docker run --name socksfilter -d --restart=always --network host esrrhs/socksfilter -s "yourserver1:1080 yourserver2:1080 yourserver3:1080"
+docker run --name socksfilter -d --restart=always \
+  -p 1080:1080 \
+  esrrhs/socksfilter -s "yourserver1:1080 yourserver2:1080 yourserver3:1080"
+```
+
+**Option 2: Host network mode (best performance on Linux)**
+```bash
+docker run --name socksfilter -d --restart=always \
+  --network host \
+  esrrhs/socksfilter -s "yourserver1:1080 yourserver2:1080 yourserver3:1080"
+```
+
+**Option 3: Mount custom rules or GeoIP database**
+```bash
+docker run --name socksfilter -d --restart=always \
+  -p 1080:1080 \
+  -v $(pwd)/GeoLite2-Country.mmdb:/app/GeoLite2-Country.mmdb \
+  -v $(pwd)/accelerated-domains.china.conf:/app/accelerated-domains.china.conf \
+  esrrhs/socksfilter -s "yourserver1:1080 yourserver2:1080 yourserver3:1080"
 ```
 
 ### Build and Development
