@@ -1,15 +1,28 @@
-FROM golang AS build-env
+# Build stage
+FROM golang:1.24-alpine AS build-env
 
 WORKDIR /app
 
-COPY go.* ./
-RUN go mod download
-COPY . ./
-RUN go mod tidy
-RUN go build -v -o socksfilter
+RUN apk add --no-cache git
 
-FROM debian
-COPY --from=build-env /app/socksfilter .
-COPY GeoLite2-Country.mmdb .
-COPY accelerated-domains.china.conf .
-WORKDIR ./
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . ./
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o socksfilter .
+
+# Final stage
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+COPY --from=build-env /app/socksfilter /app/socksfilter
+COPY GeoLite2-Country.mmdb /app/GeoLite2-Country.mmdb
+COPY accelerated-domains.china.conf /app/accelerated-domains.china.conf
+
+EXPOSE 1080
+
+ENTRYPOINT ["/app/socksfilter"]
+CMD ["-h"]

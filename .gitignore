@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+socksfilter
 
 # Test binary, built with `go test -c`
 *.test
@@ -13,3 +14,17 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# Logs
+*.log
+
+# Packaging and build outputs
+pack/
+pack.zip
+dist/
+build/
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/

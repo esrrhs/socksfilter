@@ -1,54 +1,44 @@
-#! /bin/bash
-#set -x
+#!/usr/bin/env bash
+set -e
+
 NAME="socksfilter"
+DATA_FILES=("GeoLite2-Country.mmdb" "accelerated-domains.china.conf" "README.md" "LICENSE")
+VERSION=$(git describe --tags --always 2>/dev/null || echo "0.4.0")
+LDFLAGS="-s -w -X main.version=${VERSION}"
 
-export GO111MODULE=on
+export CGO_ENABLED=0
 
-#go tool dist list
-build_list=$(go tool dist list)
+rm -rf pack pack.zip
+mkdir -p pack
 
-rm pack -rf
-rm pack.zip -f
-mkdir pack
+# Build common platforms by default, or all if BUILD_ALL=1
+if [ "${BUILD_ALL}" = "1" ]; then
+  build_list=$(go tool dist list | grep -v -E "android|ios|wasm")
+else
+  build_list="linux/amd64 linux/arm64 linux/arm windows/amd64 windows/arm64 darwin/amd64 darwin/arm64"
+fi
 
-for line in $build_list; do
-  os=$(echo "$line" | awk -F"/" '{print $1}')
-  arch=$(echo "$line" | awk -F"/" '{print $2}')
-  echo "os="$os" arch="$arch" start build"
-  if [ $os == "android" ]; then
-    continue
+for target in $build_list; do
+  os=$(echo "$target" | cut -d'/' -f1)
+  arch=$(echo "$target" | cut -d'/' -f2)
+
+  echo "==> Building ${NAME} for ${os}/${arch}..."
+  binary="${NAME}"
+  if [ "${os}" = "windows" ]; then
+    binary="${NAME}.exe"
   fi
-  if [ $os == "ios" ]; then
-    continue
-  fi
-  if [ $arch == "wasm" ]; then
-    continue
-  fi
-  CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags="-s -w"
-  if [ $? -ne 0 ]; then
-    echo "os="$os" arch="$arch" build fail"
-    exit 1
-  fi
-  if [ $os = "windows" ]; then
-    zip ${NAME}_"${os}"_"${arch}"".zip" $NAME".exe"
-    if [ $? -ne 0 ]; then
-      echo "os="$os" arch="$arch" zip fail"
-      exit 1
-    fi
-    mv ${NAME}_"${os}"_"${arch}"".zip" pack/
-    rm $NAME".exe" -f
-  else
-    zip ${NAME}_"${os}"_"${arch}"".zip" $NAME
-    if [ $? -ne 0 ]; then
-      echo "os="$os" arch="$arch" zip fail"
-      exit 1
-    fi
-    mv ${NAME}_"${os}"_"${arch}"".zip" pack/
-    rm $NAME -f
-  fi
-  echo "os="$os" arch="$arch" done build"
+
+  GOOS="${os}" GOARCH="${arch}" go build -ldflags="${LDFLAGS}" -o "${binary}" .
+
+  zip_name="${NAME}_${os}_${arch}.zip"
+  zip -q -j "${zip_name}" "${binary}" "${DATA_FILES[@]}"
+  mv "${zip_name}" pack/
+  rm -f "${binary}"
+
+  echo "    Packaged ${zip_name}"
 done
 
-zip pack.zip pack/ -r
+echo "==> Creating master pack.zip..."
+(cd pack && zip -q -r ../pack.zip .)
 
-echo "all done"
+echo "==> All builds completed successfully in pack/"

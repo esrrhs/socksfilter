@@ -1,15 +1,21 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
+	"math/rand/v2"
 	"net"
+	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/esrrhs/gohome/common"
@@ -19,26 +25,38 @@ import (
 	"github.com/esrrhs/gohome/thirdparty"
 )
 
-var listen = flag.String("l", ":1080", "listen addr")
-var servers = flag.String("s", "server1 server2 server3", "server addr")
-var sel = flag.String("select", "robin", "select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all")
-var skip = flag.String("skip", "CN", "skip country")
-var filename = flag.String("file", "GeoLite2-Country.mmdb", "ip file")
-var cache_size = flag.Int("cache_size", 1000, "cache size for dns")
-var cache_expire = flag.Int("cache_expire", 3600, "cache expire seconds for dns")
-var loglevel = flag.String("loglevel", "info", "log level")
-var nolog = flag.Int("nolog", 0, "write log file")
-var noprint = flag.Int("noprint", 0, "print stdout")
-var username = flag.String("username", "", "username")
-var password = flag.String("password", "", "password")
+var (
+	version = "0.4.0"
 
-var gDnsCache *lru.LRUMultiCache[string, string]
+	listen       = flag.String("l", ":1080", "listen addr")
+	servers      = flag.String("s", "server1 server2 server3", "server addr")
+	sel          = flag.String("select", "robin", "select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all")
+	skip         = flag.String("skip", "CN", "skip country")
+	filename     = flag.String("file", "GeoLite2-Country.mmdb", "ip file")
+	chinaDomains = flag.String("china_domains", "accelerated-domains.china.conf", "china domains file")
+	cache_size   = flag.Int("cache_size", 1000, "cache size for dns")
+	cache_expire = flag.Int("cache_expire", 3600, "cache expire seconds for dns")
+	loglevel     = flag.String("loglevel", "info", "log level")
+	nolog        = flag.Int("nolog", 0, "write log file")
+	noprint      = flag.Int("noprint", 0, "print stdout")
+	username     = flag.String("username", "", "username")
+	password     = flag.String("password", "", "password")
+	showVersion  = flag.Bool("version", false, "show version and exit")
+)
 
-var gChinaDomains map[string]bool
+var (
+	gDnsCache     *lru.LRUMultiCache[string, string]
+	gChinaDomains map[string]bool
+	gRobinIndex   atomic.Uint64
+)
 
 func main() {
-
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("socksfilter version %s\n", version)
+		return
+	}
 
 	if *servers == "" || *servers == "server1 server2 server3" {
 		fmt.Print("need servers\n")
@@ -57,7 +75,7 @@ func main() {
 		NoLogFile: *nolog > 0,
 		NoPrint:   *noprint > 0,
 	})
-	loggo.Info("start...")
+	loggo.Info("start socksfilter %s...", version)
 
 	init_env()
 
@@ -72,13 +90,29 @@ func main() {
 		loggo.Error("Error listening for tcp packets: %s", err)
 		return
 	}
+	defer tcplistenConn.Close()
 	loggo.Info("listen ok %s", tcpaddr.String())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		loggo.Info("received shutdown signal, stopping listener...")
+		_ = tcplistenConn.Close()
+	}()
 
 	for {
 		conn, err := tcplistenConn.AcceptTCP()
 		if err != nil {
-			loggo.Info("Error accept tcp %s", err)
-			continue
+			select {
+			case <-ctx.Done():
+				loggo.Info("listener closed, exiting...")
+				return
+			default:
+				loggo.Info("Error accept tcp %s", err)
+				continue
+			}
 		}
 
 		go process(conn)
@@ -89,7 +123,6 @@ func init_env() {
 	err := thirdparty.LoadGeoip2(*filename)
 	if err != nil {
 		loggo.Error("Load Sock5 ip file ERROR: %s", err.Error())
-		return
 	}
 
 	gDnsCache = lru.NewLRUMultiCache[string, string](
@@ -102,20 +135,28 @@ func init_env() {
 }
 
 func load_china_domains() {
-	// 读取accelerated-domains.china.conf
 	gChinaDomains = make(map[string]bool)
-	lines, err := ioutil.ReadFile("accelerated-domains.china.conf")
+	file, err := os.Open(*chinaDomains)
 	if err != nil {
 		loggo.Error("load_china_domains read file error: %s", err)
 		return
 	}
-	for _, line := range strings.Split(string(lines), "\n") {
-		line = strings.TrimSpace(line)
-		params := strings.Split(line, "/")
-		if len(params) >= 3 && params[0] == "server=" {
-			host := params[1]
-			gChinaDomains[host] = true
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "server=/") {
+			params := strings.Split(line, "/")
+			if len(params) >= 3 {
+				host := params[1]
+				gChinaDomains[host] = true
+			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		loggo.Error("load_china_domains scan error: %s", err)
+		return
 	}
 	loggo.Info("load_china_domains load ok: %d", len(gChinaDomains))
 }
@@ -198,28 +239,25 @@ func need_proxy(addr string) bool {
 }
 
 func process(conn *net.TCPConn) {
-
 	defer common.CrashLog()
+	defer conn.Close()
 
 	var err error = nil
 	if err = network.Sock5HandshakeBy(conn, *username, *password); err != nil {
 		loggo.Error("process socks handshake: %s", err)
-		conn.Close()
 		return
 	}
 	_, targetAddr, err := network.Sock5GetRequest(conn)
 	if err != nil {
 		loggo.Error("process error getting request: %s", err)
-		conn.Close()
 		return
 	}
 	// Sending connection established message immediately to client.
-	// This some round trip time for creating socks connection with the client.
+	// This saves some round trip time for creating socks connection with the client.
 	// But if connection failed, the client will get connection reset error.
 	_, err = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x43})
 	if err != nil {
 		loggo.Error("process send connection confirmation: %s", err)
-		conn.Close()
 		return
 	}
 
@@ -233,7 +271,6 @@ func process(conn *net.TCPConn) {
 }
 
 func process_proxy_server(conn *net.TCPConn, targetAddr string, server string) bool {
-
 	tcpaddrProxy, err := net.ResolveTCPAddr("tcp", server)
 	if err != nil {
 		loggo.Info("process_proxy_server tcp ResolveTCPAddr fail: %s %s", server, err.Error())
@@ -245,6 +282,7 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, server string) b
 		loggo.Info("process_proxy_server tcp DialTCP fail: %s %s", targetAddr, err.Error())
 		return false
 	}
+	defer proxyconn.Close()
 
 	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
 
@@ -274,38 +312,29 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, server string) b
 
 	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
-	errCh := make(chan error, 2)
-	go proxy(conn, proxyconn, conn.RemoteAddr().String(), proxyconn.RemoteAddr().String(), errCh)
-	go proxy(proxyconn, conn, proxyconn.RemoteAddr().String(), conn.RemoteAddr().String(), errCh)
-
-	for i := 0; i < 2; i++ {
-		<-errCh
-	}
-
-	conn.Close()
-	proxyconn.Close()
+	relay(conn, proxyconn)
 
 	return true
 }
 
 func process_proxy(conn *net.TCPConn, targetAddr string) {
-
 	ss := strings.Fields(*servers)
 	if len(ss) <= 0 {
 		loggo.Error("process_proxy no servers fail: %s", targetAddr)
 		return
 	}
 	if *sel == "robin" {
-		for _, server := range ss {
+		offset := int(gRobinIndex.Add(1) - 1)
+		for i := 0; i < len(ss); i++ {
+			server := ss[(offset+i)%len(ss)]
 			if process_proxy_server(conn, targetAddr, server) {
 				return
 			}
 		}
 	} else if *sel == "rand" {
-		rand.Shuffle(len(ss), func(i, j int) {
-			ss[i], ss[j] = ss[j], ss[i]
-		})
-		for _, server := range ss {
+		indexes := rand.Perm(len(ss))
+		for _, idx := range indexes {
+			server := ss[idx]
 			if process_proxy_server(conn, targetAddr, server) {
 				return
 			}
@@ -316,7 +345,7 @@ func process_proxy(conn *net.TCPConn, targetAddr string) {
 			loggo.Info("process_proxy SplitHostPort error: %s", err)
 			return
 		}
-		hash := int(common.HashString(dsthost))
+		hash := int(common.HashString(dsthost) % uint64(len(ss)))
 		for i := 0; i < len(ss); i++ {
 			server := ss[(hash+i)%len(ss)]
 			if process_proxy_server(conn, targetAddr, server) {
@@ -324,7 +353,7 @@ func process_proxy(conn *net.TCPConn, targetAddr string) {
 			}
 		}
 	} else if *sel == "hash_by_src_ip" {
-		hash := int(common.HashString(conn.RemoteAddr().(*net.TCPAddr).IP.String()))
+		hash := int(common.HashString(conn.RemoteAddr().(*net.TCPAddr).IP.String()) % uint64(len(ss)))
 		for i := 0; i < len(ss); i++ {
 			server := ss[(hash+i)%len(ss)]
 			if process_proxy_server(conn, targetAddr, server) {
@@ -332,7 +361,7 @@ func process_proxy(conn *net.TCPConn, targetAddr string) {
 			}
 		}
 	} else if *sel == "hash_all" {
-		hash := int(common.HashString(conn.RemoteAddr().String() + "-" + targetAddr))
+		hash := int(common.HashString(conn.RemoteAddr().String()+"-"+targetAddr) % uint64(len(ss)))
 		for i := 0; i < len(ss); i++ {
 			server := ss[(hash+i)%len(ss)]
 			if process_proxy_server(conn, targetAddr, server) {
@@ -346,7 +375,6 @@ func process_proxy(conn *net.TCPConn, targetAddr string) {
 }
 
 func process_direct(conn *net.TCPConn, targetAddr string) {
-
 	tcpaddrTarget, err := net.ResolveTCPAddr("tcp", targetAddr)
 	if err != nil {
 		loggo.Info("process_direct tcp ResolveTCPAddr fail: %s %s", targetAddr, err.Error())
@@ -358,26 +386,39 @@ func process_direct(conn *net.TCPConn, targetAddr string) {
 		loggo.Info("process_direct tcp DialTCP fail: %s %s", targetAddr, err.Error())
 		return
 	}
+	defer targetconn.Close()
 
 	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
 
 	loggo.Info("process_direct client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
 
-	errCh := make(chan error, 2)
-	go proxy(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String(), errCh)
-	go proxy(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String(), errCh)
-
-	for i := 0; i < 2; i++ {
-		<-errCh
-	}
-
-	conn.Close()
-	targetconn.Close()
+	relay(conn, targetconn)
 }
 
-func proxy(destination io.Writer, source io.Reader, dst string, src string, errCh chan error) {
+func relay(c1, c2 *net.TCPConn) {
+	var closeOnce sync.Once
+	closeBoth := func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	}
+
+	errCh := make(chan error, 2)
+	go proxy(c1, c2, c1.RemoteAddr().String(), c2.RemoteAddr().String(), errCh)
+	go proxy(c2, c1, c2.RemoteAddr().String(), c1.RemoteAddr().String(), errCh)
+
+	for i := 0; i < 2; i++ {
+		err := <-errCh
+		if err != nil && err != io.EOF {
+			closeOnce.Do(closeBoth)
+		}
+	}
+	closeOnce.Do(closeBoth)
+}
+
+func proxy(destination *net.TCPConn, source *net.TCPConn, dst string, src string, errCh chan error) {
 	loggo.Debug("transfer client begin transfer from %s -> %s", src, dst)
 	n, err := io.Copy(destination, source)
+	_ = destination.CloseWrite()
 	errCh <- err
 	loggo.Debug("transfer client end transfer from %s -> %s %v %v", src, dst, n, err)
 }
