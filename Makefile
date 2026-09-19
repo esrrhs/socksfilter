@@ -27,7 +27,10 @@ docker:
 update-rules:
 	@echo "Updating accelerated-domains.china.conf from upstream..."
 	curl -sL https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf -o accelerated-domains.china.conf
-	@echo "Done. Lines: $$(wc -l < accelerated-domains.china.conf)"
+	@echo "Done. Domains: $$(wc -l < accelerated-domains.china.conf)"
+	@echo "Updating GeoLite2-Country.mmdb from upstream..."
+	curl -sL https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb -o GeoLite2-Country.mmdb
+	@echo "Done. GeoLite2 size: $$(ls -lh GeoLite2-Country.mmdb | awk '{print $$5}')"
 
 clean:
 	rm -f $(NAME) $(NAME).exe pack.zip default_*.log socksfilter_*.log
