@@ -2,7 +2,7 @@ module github.com/esrrhs/socksfilter
 
 go 1.26.0
 
-require github.com/esrrhs/gohome v0.0.0-20260919110810-c3c9043b44c1
+require github.com/esrrhs/gohome v0.0.0-20260924051301-4210dd2c21f5
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8 // indirect
@@ -10,6 +10,7 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/klauspost/reedsolomon v1.14.2 // indirect
+	github.com/miekg/dns v1.1.73 // indirect
 	github.com/oschwald/geoip2-golang v1.13.0 // indirect
 	github.com/oschwald/maxminddb-golang v1.13.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
@@ -20,6 +21,7 @@ require (
 	github.com/xtaci/kcp-go v5.4.20+incompatible // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )

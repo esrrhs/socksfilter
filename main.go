@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/esrrhs/gohome/common"
+	"github.com/esrrhs/gohome/dns"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/lru"
 	"github.com/esrrhs/gohome/network"
@@ -26,7 +27,7 @@ import (
 )
 
 var (
-	version = "0.4.0"
+	version = "0.5.0"
 
 	listen       = flag.String("l", ":1080", "listen addr")
 	servers      = flag.String("s", "server1 server2 server3", "server addr")
@@ -45,6 +46,7 @@ var (
 )
 
 var (
+	gResolver     dns.Resolver
 	gDnsCache     *lru.LRUMultiCache[string, string]
 	gChinaDomains map[string]bool
 	gRobinIndex   atomic.Uint64
@@ -131,6 +133,19 @@ func init_env() {
 		time.Duration(*cache_expire)*time.Second,
 	)
 
+	cfg := dns.DefaultConfig()
+	cfg.EnableFakeIP = false // socksfilter 工作在真实目标判定模式，关闭 Fake-IP
+	cfg.GeoIPFile = *filename
+	if *chinaDomains != "" {
+		cfg.DirectDomainFiles = []string{*chinaDomains}
+	}
+	r, err := dns.NewResolver(cfg)
+	if err != nil {
+		loggo.Error("Init dns.Resolver error: %s", err)
+	} else {
+		gResolver = r
+	}
+
 	load_china_domains()
 }
 
@@ -179,6 +194,14 @@ func need_proxy(addr string) bool {
 		return false
 	}
 
+	// 优先直接使用 gResolver 的快速分流判断
+	if gResolver != nil {
+		if shouldProxy, err := gResolver.ShouldProxy(host); err == nil {
+			loggo.Info("need_proxy by gResolver: %s proxy=%v", host, shouldProxy)
+			return shouldProxy
+		}
+	}
+
 	var taddr string
 	if common.IsValidIP(root_host) {
 		taddr = root_host
@@ -196,21 +219,30 @@ func need_proxy(addr string) bool {
 				taddr = root_cache_addr
 			}
 		} else {
-			// 优先root_host解析
-			taddr, err = common.ResolveDomainToIP(root_host)
-			if err == nil {
-				gDnsCache.Set(root_host, taddr)
-				loggo.Info("need_proxy cache root set: %s %s size %v", root_host, taddr, gDnsCache.Size())
-			} else {
-				loggo.Error("need_proxy ResolveDomainToIP root error: %s %s", root_host, err)
-				// 有可能是根域名没有解析，这时候使用原始host继续
-				taddr, err = common.ResolveDomainToIP(host)
-				if err != nil {
-					loggo.Error("need_proxy ResolveDomainToIP error: %s %s", host, err)
-					return false
+			// 优先使用 gResolver 解析真实 IP
+			if gResolver != nil {
+				ip, resErr := gResolver.ResolveOne(context.Background(), root_host)
+				if resErr == nil && ip != nil {
+					taddr = ip.String()
+					gDnsCache.Set(root_host, taddr)
+					loggo.Info("need_proxy cache root set via gResolver: %s %s", root_host, taddr)
 				}
-				gDnsCache.Set(host, taddr)
-				loggo.Info("need_proxy cache set: %s %s size %v", host, taddr, gDnsCache.Size())
+			}
+			if taddr == "" {
+				taddr, err = common.ResolveDomainToIP(root_host)
+				if err == nil {
+					gDnsCache.Set(root_host, taddr)
+					loggo.Info("need_proxy cache root set: %s %s size %v", root_host, taddr, gDnsCache.Size())
+				} else {
+					loggo.Error("need_proxy ResolveDomainToIP root error: %s %s", root_host, err)
+					taddr, err = common.ResolveDomainToIP(host)
+					if err != nil {
+						loggo.Error("need_proxy ResolveDomainToIP error: %s %s", host, err)
+						return false
+					}
+					gDnsCache.Set(host, taddr)
+					loggo.Info("need_proxy cache set: %s %s size %v", host, taddr, gDnsCache.Size())
+				}
 			}
 		}
 

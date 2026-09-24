@@ -12,10 +12,11 @@ A lightweight SOCKS5 traffic routing and aggregation proxy filter.
 ## Features
 * **Standard SOCKS5 Server**: Provides standard SOCKS5 proxy service with optional username and password authentication.
 * **Smart Traffic Routing & Bypass**:
-  * **Domestic Domain Whitelist Direct**: Built-in accelerated domain whitelist (`accelerated-domains.china.conf`) for instantaneous direct connection.
+  * **Unified `gohome/dns` Engine**: Powered by `gohome/dns` with zero-config defaults, anti-pollution parallel queries, and instant bypass classification.
+  * **Domestic Domain Whitelist Direct**: Built-in accelerated domain whitelist (`accelerated-domains.china.conf`) and domain suffix tree for instantaneous direct connection.
   * **Private & LAN IP Direct**: Automatically identifies and bypasses private IP ranges (e.g. `127.0.0.1`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
   * **GeoIP Country Filtering**: Filters based on destination IP country code (default `CN`). Matches connect directly; non-matches are routed to upstream SOCKS5 servers.
-  * **High-Performance DNS Cache**: Built-in multi-core concurrent LRU cache to reduce redundant DNS lookups.
+  * **High-Performance DNS Cache**: Built-in multi-core concurrent LRU cache and singleflight deduplication to reduce redundant DNS lookups.
 * **Upstream Multi-Server Load Balancing**: Aggregates multiple backend SOCKS5 servers with flexible load balancing strategies:
   * `robin`: Thread-safe Round-Robin rotation.
   * `rand`: Random selection.
