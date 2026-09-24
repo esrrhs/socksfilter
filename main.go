@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -117,7 +118,7 @@ func main() {
 			}
 		}
 
-		go process(conn)
+		go process(ctx, conn)
 	}
 }
 
@@ -270,7 +271,66 @@ func need_proxy(addr string) bool {
 	return need_skip
 }
 
-func process(conn *net.TCPConn) {
+func getCandidateServers(targetAddr string, srcIP string, srcAddr string) []string {
+	ss := strings.Fields(*servers)
+	if len(ss) <= 0 {
+		return nil
+	}
+	res := make([]string, 0, len(ss))
+	switch *sel {
+	case "robin":
+		offset := int(gRobinIndex.Add(1) - 1)
+		for i := 0; i < len(ss); i++ {
+			res = append(res, ss[(offset+i)%len(ss)])
+		}
+	case "rand":
+		indexes := rand.Perm(len(ss))
+		for _, idx := range indexes {
+			res = append(res, ss[idx])
+		}
+	case "hash_by_dst_ip":
+		dsthost, _, err := net.SplitHostPort(targetAddr)
+		if err != nil {
+			return ss
+		}
+		hash := int(common.HashString(dsthost) % uint64(len(ss)))
+		for i := 0; i < len(ss); i++ {
+			res = append(res, ss[(hash+i)%len(ss)])
+		}
+	case "hash_by_src_ip":
+		hash := int(common.HashString(srcIP) % uint64(len(ss)))
+		for i := 0; i < len(ss); i++ {
+			res = append(res, ss[(hash+i)%len(ss)])
+		}
+	case "hash_all":
+		hash := int(common.HashString(srcAddr+"-"+targetAddr) % uint64(len(ss)))
+		for i := 0; i < len(ss); i++ {
+			res = append(res, ss[(hash+i)%len(ss)])
+		}
+	default:
+		loggo.Error("select type error: %s", *sel)
+		return ss
+	}
+	return res
+}
+
+func getOutboundIPFor(dst net.IP) net.IP {
+	if dst == nil {
+		return nil
+	}
+	networkStr := "udp4"
+	if dst.To4() == nil {
+		networkStr = "udp6"
+	}
+	dummyConn, err := net.Dial(networkStr, net.JoinHostPort(dst.String(), "1"))
+	if err != nil {
+		return nil
+	}
+	defer dummyConn.Close()
+	return dummyConn.LocalAddr().(*net.UDPAddr).IP
+}
+
+func process(ctx context.Context, conn *net.TCPConn) {
 	defer common.CrashLog()
 	defer conn.Close()
 
@@ -279,27 +339,441 @@ func process(conn *net.TCPConn) {
 		loggo.Error("process socks handshake: %s", err)
 		return
 	}
-	_, targetAddr, err := network.Sock5GetRequest(conn)
+	cmd, _, targetAddr, err := network.Sock5GetRequest(conn)
 	if err != nil {
 		loggo.Error("process error getting request: %s", err)
 		return
 	}
-	// Sending connection established message immediately to client.
-	// This saves some round trip time for creating socks connection with the client.
-	// But if connection failed, the client will get connection reset error.
-	_, err = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x43})
-	if err != nil {
-		loggo.Error("process send connection confirmation: %s", err)
+
+	if cmd == network.Socks5CmdConnect {
+		// Sending connection established message immediately to client.
+		// This saves some round trip time for creating socks connection with the client.
+		// But if connection failed, the client will get connection reset error.
+		_, err = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x43})
+		if err != nil {
+			loggo.Error("process send connection confirmation: %s", err)
+			return
+		}
+
+		loggo.Info("process accept new sock5 conn: %s", targetAddr)
+
+		if need_proxy(targetAddr) {
+			process_proxy(conn, targetAddr)
+		} else {
+			process_direct(conn, targetAddr)
+		}
+	} else if cmd == network.Socks5CmdUDPAssociate {
+		process_udp(ctx, conn, targetAddr)
+	} else {
+		loggo.Error("process unsupported socks command: %d", cmd)
+		_ = network.Sock5SendConnectReply(conn, 0x07, "0.0.0.0:0")
+	}
+}
+
+type udpUpstreamSession struct {
+	server        string
+	proxyTCPConn  *net.TCPConn
+	proxyUDPConn  *net.UDPConn
+	upstreamRelay *net.UDPAddr
+	closeOnce     sync.Once
+}
+
+func (s *udpUpstreamSession) close() {
+	s.closeOnce.Do(func() {
+		if s.proxyTCPConn != nil {
+			_ = s.proxyTCPConn.Close()
+		}
+		if s.proxyUDPConn != nil {
+			_ = s.proxyUDPConn.Close()
+		}
+	})
+}
+
+type udpAssociation struct {
+	clientTCPConn       *net.TCPConn
+	clientTCPRemoteAddr *net.TCPAddr
+	clientExpectedIP    net.IP
+	clientRelayConn     *net.UDPConn
+
+	activeClientUDPAddr atomic.Pointer[net.UDPAddr]
+	closed              atomic.Bool
+	packetWg            sync.WaitGroup
+
+	directMu   sync.Mutex
+	directConn *net.UDPConn
+
+	upstreamMu       sync.Mutex
+	upstreamSessions map[string]*udpUpstreamSession
+}
+
+func (assoc *udpAssociation) close() {
+	if assoc.closed.CompareAndSwap(false, true) {
+		if assoc.clientRelayConn != nil {
+			_ = assoc.clientRelayConn.Close()
+		}
+		assoc.directMu.Lock()
+		if assoc.directConn != nil {
+			_ = assoc.directConn.Close()
+		}
+		assoc.directMu.Unlock()
+
+		assoc.upstreamMu.Lock()
+		for _, s := range assoc.upstreamSessions {
+			s.close()
+		}
+		assoc.upstreamSessions = make(map[string]*udpUpstreamSession)
+		assoc.upstreamMu.Unlock()
+
+		assoc.packetWg.Wait()
+	}
+}
+
+func (assoc *udpAssociation) runClientRelay() {
+	buf := make([]byte, 65535)
+	for {
+		n, srcAddr, err := assoc.clientRelayConn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		if assoc.closed.Load() {
+			return
+		}
+
+		if !srcAddr.IP.Equal(assoc.clientExpectedIP) {
+			loggo.Debug("udp drop packet from unexpected source: %s, expected: %s", srcAddr, assoc.clientExpectedIP)
+			continue
+		}
+
+		assoc.activeClientUDPAddr.Store(srcAddr)
+
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		assoc.packetWg.Add(1)
+		go func(p []byte) {
+			defer assoc.packetWg.Done()
+			assoc.handlePacket(p)
+		}(pkt)
+	}
+}
+
+func (assoc *udpAssociation) handlePacket(pkt []byte) {
+	if assoc.closed.Load() {
 		return
 	}
 
-	loggo.Info("process accept new sock5 conn: %s", targetAddr)
+	host, port, data, err := network.Sock5UnpackUDP(pkt)
+	if err != nil {
+		loggo.Debug("udp Sock5UnpackUDP error: %s", err)
+		return
+	}
+
+	targetAddr := net.JoinHostPort(host, strconv.Itoa(port))
+	loggo.Debug("udp receive packet for target %s from client %s (data len %d)", targetAddr, assoc.clientTCPRemoteAddr, len(data))
 
 	if need_proxy(targetAddr) {
-		process_proxy(conn, targetAddr)
+		assoc.handleProxyPacket(targetAddr, pkt)
 	} else {
-		process_direct(conn, targetAddr)
+		assoc.handleDirectPacket(targetAddr, host, port, data)
 	}
+}
+
+func (assoc *udpAssociation) handleDirectPacket(targetAddr string, host string, port int, data []byte) {
+	dConn, err := assoc.getOrCreateDirectConn()
+	if err != nil {
+		loggo.Info("udp getOrCreateDirectConn fail: %s", err)
+		return
+	}
+
+	resolvedHost := host
+	if !common.IsValidIP(host) {
+		if cacheIP, ok := gDnsCache.Get(host); ok && cacheIP != "" {
+			resolvedHost = cacheIP
+		} else {
+			rootHost, err := common.GetRootDomain(targetAddr)
+			if err == nil {
+				if rootCacheIP, ok := gDnsCache.Get(rootHost); ok && rootCacheIP != "" {
+					resolvedHost = rootCacheIP
+				}
+			}
+		}
+	}
+
+	targetResolvedAddr := net.JoinHostPort(resolvedHost, strconv.Itoa(port))
+	udpTarget, err := net.ResolveUDPAddr("udp", targetResolvedAddr)
+	if err != nil {
+		loggo.Info("udp direct ResolveUDPAddr error: %s %s", targetResolvedAddr, err)
+		return
+	}
+
+	_, err = dConn.WriteToUDP(data, udpTarget)
+	if err != nil {
+		loggo.Info("udp direct WriteToUDP error: %s %s", targetResolvedAddr, err)
+		return
+	}
+}
+
+func (assoc *udpAssociation) getOrCreateDirectConn() (*net.UDPConn, error) {
+	assoc.directMu.Lock()
+	defer assoc.directMu.Unlock()
+
+	if assoc.closed.Load() {
+		return nil, errors.New("association closed")
+	}
+	if assoc.directConn != nil {
+		return assoc.directConn, nil
+	}
+
+	dConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	assoc.directConn = dConn
+
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, remoteAddr, err := dConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if assoc.closed.Load() {
+				return
+			}
+			clientAddr := assoc.activeClientUDPAddr.Load()
+			if clientAddr == nil {
+				continue
+			}
+			respPkt, err := network.Sock5PackUDP(remoteAddr.IP.String(), remoteAddr.Port, buf[:n])
+			if err != nil {
+				continue
+			}
+			_, _ = assoc.clientRelayConn.WriteToUDP(respPkt, clientAddr)
+		}
+	}()
+
+	return assoc.directConn, nil
+}
+
+func (assoc *udpAssociation) handleProxyPacket(targetAddr string, pkt []byte) {
+	candidates := getCandidateServers(targetAddr, assoc.clientTCPRemoteAddr.IP.String(), assoc.clientTCPRemoteAddr.String())
+	if len(candidates) == 0 {
+		loggo.Error("udp handleProxyPacket no servers fail: %s", targetAddr)
+		return
+	}
+
+	for _, server := range candidates {
+		session, err := assoc.getOrCreateUpstreamSession(server)
+		if err != nil {
+			loggo.Info("udp getOrCreateUpstreamSession fail: %s %s", server, err)
+			continue
+		}
+		_, err = session.proxyUDPConn.WriteToUDP(pkt, session.upstreamRelay)
+		if err != nil {
+			loggo.Info("udp WriteToUDP to upstream %s fail: %s", server, err)
+			assoc.removeUpstreamSession(server)
+			continue
+		}
+		return
+	}
+	loggo.Info("udp handleProxyPacket no valid servers: %s", targetAddr)
+}
+
+func (assoc *udpAssociation) getOrCreateUpstreamSession(server string) (*udpUpstreamSession, error) {
+	assoc.upstreamMu.Lock()
+	defer assoc.upstreamMu.Unlock()
+
+	if assoc.closed.Load() {
+		return nil, errors.New("association closed")
+	}
+
+	if sess, ok := assoc.upstreamSessions[server]; ok {
+		return sess, nil
+	}
+
+	tcpaddrProxy, err := net.ResolveTCPAddr("tcp", server)
+	if err != nil {
+		return nil, err
+	}
+
+	proxyTCPConn, err := net.DialTCP("tcp", nil, tcpaddrProxy)
+	if err != nil {
+		return nil, err
+	}
+
+	err = network.Sock5Handshake(proxyTCPConn, 5000, "", "")
+	if err != nil {
+		_ = proxyTCPConn.Close()
+		return nil, err
+	}
+
+	bnd, err := network.Sock5SetUDPRequest(proxyTCPConn, "0.0.0.0", 0, 5000)
+	if err != nil {
+		_ = proxyTCPConn.Close()
+		return nil, err
+	}
+
+	bndHost, bndPortStr, err := net.SplitHostPort(bnd)
+	if err != nil {
+		_ = proxyTCPConn.Close()
+		return nil, err
+	}
+	bndPort, err := strconv.Atoi(bndPortStr)
+	if err != nil {
+		_ = proxyTCPConn.Close()
+		return nil, err
+	}
+	bndIP := net.ParseIP(bndHost)
+	if bndIP == nil {
+		resolved, rErr := net.ResolveIPAddr("ip", bndHost)
+		if rErr == nil && resolved != nil {
+			bndIP = resolved.IP
+		}
+	}
+	if bndIP == nil || bndIP.IsUnspecified() {
+		bndIP = proxyTCPConn.RemoteAddr().(*net.TCPAddr).IP
+	}
+	relayUDPAddr := &net.UDPAddr{IP: bndIP, Port: bndPort}
+
+	proxyUDPConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		_ = proxyTCPConn.Close()
+		return nil, err
+	}
+
+	session := &udpUpstreamSession{
+		server:        server,
+		proxyTCPConn:  proxyTCPConn,
+		proxyUDPConn:  proxyUDPConn,
+		upstreamRelay: relayUDPAddr,
+	}
+
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, _, err := proxyUDPConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if assoc.closed.Load() {
+				return
+			}
+			clientAddr := assoc.activeClientUDPAddr.Load()
+			if clientAddr == nil {
+				continue
+			}
+			_, _ = assoc.clientRelayConn.WriteToUDP(buf[:n], clientAddr)
+		}
+	}()
+
+	go func() {
+		dummy := make([]byte, 1)
+		for {
+			_, err := proxyTCPConn.Read(dummy)
+			if err != nil {
+				session.close()
+				assoc.removeUpstreamSession(server)
+				return
+			}
+		}
+	}()
+
+	assoc.upstreamSessions[server] = session
+	loggo.Info("udp established upstream session to %s (relay %s) for client %s", server, relayUDPAddr, assoc.clientTCPRemoteAddr)
+	return session, nil
+}
+
+func (assoc *udpAssociation) removeUpstreamSession(server string) {
+	assoc.upstreamMu.Lock()
+	defer assoc.upstreamMu.Unlock()
+	if sess, ok := assoc.upstreamSessions[server]; ok {
+		sess.close()
+		delete(assoc.upstreamSessions, server)
+	}
+}
+
+func process_udp(ctx context.Context, conn *net.TCPConn, targetAddr string) {
+	defer common.CrashLog()
+
+	localTCPAddr := conn.LocalAddr().(*net.TCPAddr)
+	remoteTCPAddr := conn.RemoteAddr().(*net.TCPAddr)
+
+	bndIP := localTCPAddr.IP
+	if bndIP == nil || bndIP.IsUnspecified() {
+		if remoteTCPAddr.IP.IsLoopback() {
+			if remoteTCPAddr.IP.To4() != nil {
+				bndIP = net.IPv4(127, 0, 0, 1)
+			} else {
+				bndIP = net.IPv6loopback
+			}
+		} else if outIP := getOutboundIPFor(remoteTCPAddr.IP); outIP != nil {
+			bndIP = outIP
+		} else {
+			bndIP = net.IPv4(127, 0, 0, 1)
+		}
+	}
+
+	clientRelayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bndIP, Port: 0})
+	if err != nil {
+		clientRelayConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+		if err != nil {
+			loggo.Error("process_udp ListenUDP fail: %s", err)
+			_ = network.Sock5SendConnectReply(conn, 0x01, "0.0.0.0:0")
+			return
+		}
+	}
+
+	relayUDPAddr := clientRelayConn.LocalAddr().(*net.UDPAddr)
+	bndAddr := net.JoinHostPort(bndIP.String(), strconv.Itoa(relayUDPAddr.Port))
+
+	err = network.Sock5SendConnectReply(conn, 0x00, bndAddr)
+	if err != nil {
+		loggo.Error("process_udp Sock5SendConnectReply fail: %s", err)
+		_ = clientRelayConn.Close()
+		return
+	}
+
+	loggo.Info("process_udp accept new sock5 udp associate: client=%s bnd=%s", remoteTCPAddr, bndAddr)
+
+	assoc := &udpAssociation{
+		clientTCPConn:       conn,
+		clientTCPRemoteAddr: remoteTCPAddr,
+		clientExpectedIP:    remoteTCPAddr.IP,
+		clientRelayConn:     clientRelayConn,
+		upstreamSessions:    make(map[string]*udpUpstreamSession),
+	}
+
+	if targetHost, targetPortStr, err := net.SplitHostPort(targetAddr); err == nil {
+		if targetPort, err := strconv.Atoi(targetPortStr); err == nil && targetPort > 0 {
+			targetIP := net.ParseIP(targetHost)
+			if targetIP != nil && !targetIP.IsUnspecified() {
+				assoc.activeClientUDPAddr.Store(&net.UDPAddr{IP: targetIP, Port: targetPort})
+			}
+		}
+	}
+
+	defer assoc.close()
+
+	go assoc.runClientRelay()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
+	buf := make([]byte, 1024)
+	for {
+		_, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+	loggo.Info("process_udp client tcp closed, terminating association: client=%s", remoteTCPAddr)
 }
 
 func process_proxy_server(conn *net.TCPConn, targetAddr string, server string) bool {
@@ -350,58 +824,16 @@ func process_proxy_server(conn *net.TCPConn, targetAddr string, server string) b
 }
 
 func process_proxy(conn *net.TCPConn, targetAddr string) {
-	ss := strings.Fields(*servers)
-	if len(ss) <= 0 {
+	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
+	candidates := getCandidateServers(targetAddr, tcpsrcaddr.IP.String(), tcpsrcaddr.String())
+	if len(candidates) == 0 {
 		loggo.Error("process_proxy no servers fail: %s", targetAddr)
 		return
 	}
-	if *sel == "robin" {
-		offset := int(gRobinIndex.Add(1) - 1)
-		for i := 0; i < len(ss); i++ {
-			server := ss[(offset+i)%len(ss)]
-			if process_proxy_server(conn, targetAddr, server) {
-				return
-			}
-		}
-	} else if *sel == "rand" {
-		indexes := rand.Perm(len(ss))
-		for _, idx := range indexes {
-			server := ss[idx]
-			if process_proxy_server(conn, targetAddr, server) {
-				return
-			}
-		}
-	} else if *sel == "hash_by_dst_ip" {
-		dsthost, _, err := net.SplitHostPort(targetAddr)
-		if err != nil {
-			loggo.Info("process_proxy SplitHostPort error: %s", err)
+	for _, server := range candidates {
+		if process_proxy_server(conn, targetAddr, server) {
 			return
 		}
-		hash := int(common.HashString(dsthost) % uint64(len(ss)))
-		for i := 0; i < len(ss); i++ {
-			server := ss[(hash+i)%len(ss)]
-			if process_proxy_server(conn, targetAddr, server) {
-				return
-			}
-		}
-	} else if *sel == "hash_by_src_ip" {
-		hash := int(common.HashString(conn.RemoteAddr().(*net.TCPAddr).IP.String()) % uint64(len(ss)))
-		for i := 0; i < len(ss); i++ {
-			server := ss[(hash+i)%len(ss)]
-			if process_proxy_server(conn, targetAddr, server) {
-				return
-			}
-		}
-	} else if *sel == "hash_all" {
-		hash := int(common.HashString(conn.RemoteAddr().String()+"-"+targetAddr) % uint64(len(ss)))
-		for i := 0; i < len(ss); i++ {
-			server := ss[(hash+i)%len(ss)]
-			if process_proxy_server(conn, targetAddr, server) {
-				return
-			}
-		}
-	} else {
-		loggo.Error("process_proxy select type error: %s", *sel)
 	}
 	loggo.Info("process_proxy no valid servers fail: %s", *servers)
 }

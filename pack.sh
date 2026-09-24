@@ -3,7 +3,7 @@ set -e
 
 NAME="socksfilter"
 DATA_FILES=("GeoLite2-Country.mmdb" "accelerated-domains.china.conf" "README.md" "LICENSE")
-VERSION=$(git describe --tags --always 2>/dev/null || echo "0.4.0")
+VERSION=$(git describe --tags --always 2>/dev/null || echo "0.5.0")
 LDFLAGS="-s -w -X main.version=${VERSION}"
 
 export CGO_ENABLED=0

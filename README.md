@@ -10,7 +10,8 @@
 A lightweight SOCKS5 traffic routing and aggregation proxy filter.
 
 ## Features
-* **Standard SOCKS5 Server**: Provides standard SOCKS5 proxy service with optional username and password authentication.
+* **Standard SOCKS5 Server**: Provides standard SOCKS5 proxy service with TCP CONNECT and UDP ASSOCIATE support (RFC 1928 / RFC 1929), along with optional username and password authentication.
+* **Full UDP Relay & Forwarding**: Transparently routes UDP datagrams: domestic and private destinations are relayed directly, while foreign destinations are forwarded through upstream SOCKS5 proxies using UDP ASSOCIATE relaying with load balancing.
 * **Smart Traffic Routing & Bypass**:
   * **Unified `gohome/dns` Engine**: Powered by `gohome/dns` with zero-config defaults, anti-pollution parallel queries, and instant bypass classification.
   * **Domestic Domain Whitelist Direct**: Built-in accelerated domain whitelist (`accelerated-domains.china.conf`) and domain suffix tree for instantaneous direct connection.

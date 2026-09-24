@@ -1,7 +1,7 @@
 .PHONY: all build test vet tidy pack docker update-rules clean
 
 NAME := socksfilter
-VERSION := $(shell git describe --tags --always 2>/dev/null || echo "0.4.0")
+VERSION := $(shell git describe --tags --always 2>/dev/null || echo "0.5.0")
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 all: build
