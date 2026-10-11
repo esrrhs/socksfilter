@@ -3093,3 +3093,177 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		}
 	}
 }
+
+// ---- Prometheus /metrics ----
+
+// validPromMetricName 校验指标名满足 Prometheus 词法 [a-zA-Z_:][a-zA-Z0-9_:]*。
+func validPromMetricName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r == '_' || r == ':':
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func TestPrometheusMetricsEndpoint(t *testing.T) {
+	addr, stop, err := startStatsServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("start stats server fail: %v", err)
+	}
+	defer stop()
+
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics fail: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/plain; version=0.0.4; charset=utf-8" {
+		t.Errorf("expected prometheus content type, got %q", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+
+	// 所有指标族都必须声明正确的类型
+	for name, typ := range map[string]string{
+		"socksfilter_build_info":                          "gauge",
+		"socksfilter_tcp_connections_active":              "gauge",
+		"socksfilter_tcp_connections_total":               "counter",
+		"socksfilter_tcp_connections_rejected_total":      "counter",
+		"socksfilter_udp_associations_active":             "gauge",
+		"socksfilter_udp_associations_total":              "counter",
+		"socksfilter_tcp_relay_bytes_total":               "counter",
+		"socksfilter_max_connections":                     "gauge",
+		"socksfilter_upstream_up":                         "gauge",
+		"socksfilter_upstream_consecutive_failures":       "gauge",
+		"socksfilter_upstream_session_attempts_total":     "counter",
+		"socksfilter_upstream_sessions_established_total": "counter",
+		"socksfilter_upstream_connect_failures_total":     "counter",
+	} {
+		if !strings.Contains(text, "# TYPE "+name+" "+typ) {
+			t.Errorf("missing TYPE declaration for %s %s", name, typ)
+		}
+	}
+
+	// 每个样本行必须是 name[{labels}] value 形式
+	samples := 0
+	for _, line := range strings.Split(text, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		samples++
+		sp := strings.IndexByte(line, ' ')
+		if sp <= 0 {
+			t.Errorf("malformed metric line: %q", line)
+			continue
+		}
+		name, labels, ok := strings.Cut(line[:sp], "{")
+		if ok {
+			if !strings.HasSuffix(labels, "}") {
+				t.Errorf("malformed labels on line: %q", line)
+			}
+		}
+		if !validPromMetricName(name) {
+			t.Errorf("invalid metric name %q on line: %q", name, line)
+		}
+		if line[sp+1:] == "" {
+			t.Errorf("missing value on line: %q", line)
+		}
+	}
+	if samples < 15 {
+		t.Fatalf("expected >=15 metric samples, got %d", samples)
+	}
+	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
+		t.Errorf("missing build info sample %q", want)
+	}
+
+	// HEAD：有头无体
+	headResp, err := http.Head("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("HEAD /metrics fail: %v", err)
+	}
+	headResp.Body.Close()
+	if headResp.StatusCode != http.StatusOK || headResp.Header.Get("Content-Type") != "text/plain; version=0.0.4; charset=utf-8" {
+		t.Errorf("unexpected HEAD response: %d %q", headResp.StatusCode, headResp.Header.Get("Content-Type"))
+	}
+
+	// 其他方法 405
+	postResp, err := http.Post("http://"+addr+"/metrics", "text/plain", nil)
+	if err != nil {
+		t.Fatalf("POST /metrics fail: %v", err)
+	}
+	postResp.Body.Close()
+	if postResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for POST, got %d", postResp.StatusCode)
+	}
+}
+
+func TestPrometheusMetricsUpstreamCounters(t *testing.T) {
+	init_env()
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	dead := "127.0.0.1:1"
+	withGlobalFlags(t, dead, "", "")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	t.Cleanup(cleanupSF)
+
+	// 需要连续 healthFailThreshold 次失败才会摘除上游
+	for i := 0; i < healthFailThreshold; i++ {
+		c := proxyRequestOnce(t, sfAddr)
+		_ = c.Close()
+	}
+
+	h := getUpstreamHealth(dead)
+	waitFor(t, "dead upstream counters settled", 3*time.Second, func() bool {
+		return h.attempts.Load() == healthFailThreshold && h.connectFails.Load() == healthFailThreshold
+	})
+
+	text := renderPrometheusMetrics(time.Now())
+	label := `{upstream="` + dead + `"}`
+	for _, want := range []string{
+		"socksfilter_upstream_up" + label + " 0",
+		fmt.Sprintf("socksfilter_upstream_session_attempts_total%s %d", label, healthFailThreshold),
+		"socksfilter_upstream_sessions_established_total" + label + " 0",
+		fmt.Sprintf("socksfilter_upstream_connect_failures_total%s %d", label, healthFailThreshold),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+func TestPrometheusMetricsEmptyUpstreams(t *testing.T) {
+	oldServers := *servers
+	*servers = ""
+	t.Cleanup(func() { *servers = oldServers })
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_up gauge") {
+		t.Errorf("upstream TYPE declarations should still be emitted")
+	}
+	if strings.Contains(text, "socksfilter_upstream_up{") {
+		t.Errorf("no upstream samples expected with empty server list:\n%s", text)
+	}
+	if !strings.Contains(text, "socksfilter_max_connections 0") {
+		t.Errorf("expected max_connections gauge present")
+	}
+}
+
+func TestPromLabelValueEscape(t *testing.T) {
+	got := promLabelValue(`a"b` + "\\" + `c
+d`)
+	if got != `a\"b\\c\nd` {
+		t.Errorf("unexpected escaping: %q", got)
+	}
+}

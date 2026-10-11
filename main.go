@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	version = "0.7.3"
+	version = "0.7.4"
 
 	listen             = flag.String("l", ":1080", "listen addr")
 	servers            = flag.String("s", "server1 server2 server3", "server addr")
@@ -238,6 +238,7 @@ func startStatsServer(addr string) (string, func(), error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", handleStats)
+	mux.HandleFunc("/metrics", handleMetrics)
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", handleReadyz)
 	srv := &http.Server{Handler: mux}
@@ -247,7 +248,7 @@ func startStatsServer(addr string) (string, func(), error) {
 		}
 	}()
 	stop := func() { _ = srv.Close() }
-	loggo.Info("observability endpoint listening on http://%s ({/stats,/healthz,/readyz})", ln.Addr().String())
+	loggo.Info("observability endpoint listening on http://%s ({/stats,/metrics,/healthz,/readyz})", ln.Addr().String())
 	return ln.Addr().String(), stop, nil
 }
 
@@ -316,6 +317,78 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write([]byte(renderStats(time.Now())))
+}
+
+// promLabelValue 按 Prometheus 文本格式要求转义标签值。
+func promLabelValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	return s
+}
+
+// renderPrometheusMetrics 生成 Prometheus 文本格式（0.0.4）快照，独立于 HTTP
+// 以便测试。所有指标带 socksfilter_ 前缀；_total 后缀保证单调不减，
+// upstream_failures 会被成功清零，因此作为 gauge 暴露。
+func renderPrometheusMetrics(now time.Time) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "# HELP socksfilter_build_info Build version information.\n# TYPE socksfilter_build_info gauge\nsocksfilter_build_info{version=\"%s\"} 1\n",
+		promLabelValue(version))
+
+	b.WriteString("# HELP socksfilter_tcp_connections_active Currently active TCP proxy sessions.\n# TYPE socksfilter_tcp_connections_active gauge\n")
+	fmt.Fprintf(&b, "socksfilter_tcp_connections_active %d\n", gActiveTCPConns.Load())
+	b.WriteString("# HELP socksfilter_tcp_connections_total Total accepted TCP proxy sessions.\n# TYPE socksfilter_tcp_connections_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_tcp_connections_total %d\n", gTotalTCPConns.Load())
+	b.WriteString("# HELP socksfilter_tcp_connections_rejected_total Total sessions rejected by the -max-conn limit.\n# TYPE socksfilter_tcp_connections_rejected_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_tcp_connections_rejected_total %d\n", gRejectedConns.Load())
+
+	b.WriteString("# HELP socksfilter_udp_associations_active Currently active UDP associations.\n# TYPE socksfilter_udp_associations_active gauge\n")
+	fmt.Fprintf(&b, "socksfilter_udp_associations_active %d\n", gActiveUDPAssoc.Load())
+	b.WriteString("# HELP socksfilter_udp_associations_total Total accepted UDP associations.\n# TYPE socksfilter_udp_associations_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_udp_associations_total %d\n", gTotalUDPAssoc.Load())
+
+	b.WriteString("# HELP socksfilter_tcp_relay_bytes_total Cumulative relayed TCP payload bytes.\n# TYPE socksfilter_tcp_relay_bytes_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_tcp_relay_bytes_total{direction=\"%s\"} %d\n",
+		"client_to_target", gBytesClientToTarget.Load())
+	fmt.Fprintf(&b, "socksfilter_tcp_relay_bytes_total{direction=\"%s\"} %d\n",
+		"target_to_client", gBytesTargetToClient.Load())
+
+	b.WriteString("# HELP socksfilter_max_connections Configured concurrent session limit; 0 means unlimited.\n# TYPE socksfilter_max_connections gauge\n")
+	fmt.Fprintf(&b, "socksfilter_max_connections %d\n", *maxConn)
+
+	b.WriteString("# HELP socksfilter_upstream_up 1 if the upstream can serve traffic (alive or half-open probe), 0 if removed.\n# TYPE socksfilter_upstream_up gauge\n")
+	b.WriteString("# HELP socksfilter_upstream_consecutive_failures Consecutive passive health failures counted since the last success (0 on healthy).\n# TYPE socksfilter_upstream_consecutive_failures gauge\n")
+	b.WriteString("# HELP socksfilter_upstream_session_attempts_total Total session establishment attempts via this upstream (TCP CONNECT plus UDP ASSOCIATE; reused UDP sessions not recounted).\n# TYPE socksfilter_upstream_session_attempts_total counter\n")
+	b.WriteString("# HELP socksfilter_upstream_sessions_established_total Total sessions established successfully via this upstream.\n# TYPE socksfilter_upstream_sessions_established_total counter\n")
+	b.WriteString("# HELP socksfilter_upstream_connect_failures_total Total session establishment failures via this upstream.\n# TYPE socksfilter_upstream_connect_failures_total counter\n")
+	for _, server := range strings.Fields(*servers) {
+		h := getUpstreamHealth(server)
+		up := int64(0)
+		if h.isAlive(now) {
+			up = 1
+		}
+		label := fmt.Sprintf("{upstream=\"%s\"}", promLabelValue(server))
+		fmt.Fprintf(&b, "socksfilter_upstream_up%s %d\n", label, up)
+		fmt.Fprintf(&b, "socksfilter_upstream_consecutive_failures%s %d\n", label, h.fails.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_session_attempts_total%s %d\n", label, h.attempts.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_sessions_established_total%s %d\n", label, h.established.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_connect_failures_total%s %d\n", label, h.connectFails.Load())
+	}
+	return b.String()
+}
+
+func handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !allowProbeMethod(w, r) {
+		return
+	}
+	// Prometheus 解析器要求显式声明 exposition format 版本。
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write([]byte(renderPrometheusMetrics(time.Now())))
 }
 
 // handleHealthz 存活探针：观测 HTTP 服务本身能响应即代表进程存活，恒返回 200。
