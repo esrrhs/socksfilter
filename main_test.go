@@ -1655,7 +1655,7 @@ func TestRelayIdleTimeoutClosesSilent(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		relay(context.Background(), relClient, relTarget)
+		relay(context.Background(), relClient, relTarget, nil, nil)
 		close(done)
 	}()
 
@@ -1686,7 +1686,7 @@ func TestRelayIdleTimeoutTrafficKeepsAlive(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		relay(context.Background(), relClient, relTarget)
+		relay(context.Background(), relClient, relTarget, nil, nil)
 		close(done)
 	}()
 
@@ -1735,7 +1735,7 @@ func TestRelayIdleTimeoutDisabled(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		relay(context.Background(), relClient, relTarget)
+		relay(context.Background(), relClient, relTarget, nil, nil)
 		close(done)
 	}()
 
@@ -1792,7 +1792,7 @@ func TestRelayCancelForceCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		relay(ctx, relClient, relTarget)
+		relay(ctx, relClient, relTarget, nil, nil)
 		close(done)
 	}()
 
@@ -2567,6 +2567,7 @@ func TestStatsHTTPEndpoint(t *testing.T) {
 		"tcp_connections: active=",
 		"udp_associations: active=",
 		"tcp_relay_bytes: client_to_target=",
+		"route_relay_bytes(tcp+udp payload): direct_c2t=",
 		"upstreams:",
 	} {
 		if !strings.Contains(text, want) {
@@ -3071,10 +3072,177 @@ func TestUpstreamCountersUDPSessionReuse(t *testing.T) {
 	}
 }
 
-// TestStatsRendersUpstreamCounters 验证 /stats 文本包含每上游的三个累计字段。
+// ---- v0.7.6 按出口归因的中继字节统计（TCP/UDP × direct/upstream）----
+
+// TestRouteBytesTCPDirect 验证 TCP 直连流量只计入 direct 桶，双向有效载荷精确归因。
+func TestRouteBytesTCPDirect(t *testing.T) {
+	init_env()
+	withIdleFlag(t, 0)
+
+	echoAddr, cleanupEcho := startEchoTCP(t)
+	defer cleanupEcho()
+	sfAddr, _, _, _ := serveTestEnv(t)
+
+	beforeC2T := gRouteBytesDirectC2T.Load()
+	beforeT2C := gRouteBytesDirectT2C.Load()
+
+	client := socksConnectTo(t, sfAddr, echoAddr)
+	payload := bytes.Repeat([]byte("d"), 1000)
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("write payload fail: %v", err)
+	}
+	echoBuf := make([]byte, len(payload))
+	if _, err := io.ReadFull(client, echoBuf); err != nil {
+		t.Fatalf("read echo fail: %v", err)
+	}
+	_ = client.Close()
+
+	// 两个方向的 io.Copy 在收到 FIN 后入账，等待终态精确相等。
+	want := int64(len(payload))
+	waitFor(t, "direct tcp route bytes settled", 3*time.Second, func() bool {
+		return gRouteBytesDirectC2T.Load() == beforeC2T+want &&
+			gRouteBytesDirectT2C.Load() == beforeT2C+want
+	})
+}
+
+// TestRouteBytesTCPProxy 验证经上游的 TCP 流量计入该上游的字节桶，
+// 直连桶保持不变，且 SOCKS5 握手字节不被计入（只计隧道内有效载荷）。
+func TestRouteBytesTCPProxy(t *testing.T) {
+	init_env()
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	echoAddr, cleanupEcho := startEchoTCP(t)
+	t.Cleanup(cleanupEcho)
+	upstreamAddr, cleanupUp := startAuthConnectUpstream(t, "", "", echoAddr)
+	t.Cleanup(cleanupUp)
+
+	withGlobalFlags(t, upstreamAddr, "", "")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	t.Cleanup(cleanupSF)
+
+	directBeforeC2T := gRouteBytesDirectC2T.Load()
+	directBeforeT2C := gRouteBytesDirectT2C.Load()
+
+	payload := []byte("route-bytes-ping!!") // 18 字节
+	client := proxyRequestOnce(t, sfAddr)
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("write fail: %v", err)
+	}
+	echoBuf := make([]byte, len(payload))
+	if _, err := io.ReadFull(client, echoBuf); err != nil {
+		t.Fatalf("read echo fail: %v", err)
+	}
+	_ = client.Close()
+
+	h := getUpstreamHealth(upstreamAddr)
+	want := int64(len(payload))
+	waitFor(t, "upstream tcp route bytes settled", 3*time.Second, func() bool {
+		return h.bytesC2T.Load() == want && h.bytesT2C.Load() == want
+	})
+	if gRouteBytesDirectC2T.Load() != directBeforeC2T || gRouteBytesDirectT2C.Load() != directBeforeT2C {
+		t.Errorf("direct counters must stay unchanged via upstream route: c2t %d->%d t2c %d->%d",
+			directBeforeC2T, gRouteBytesDirectC2T.Load(), directBeforeT2C, gRouteBytesDirectT2C.Load())
+	}
+}
+
+// TestRouteBytesUDPDirect 验证 UDP 直连数据报按解包后的有效载荷归因到 direct 桶。
+func TestRouteBytesUDPDirect(t *testing.T) {
+	init_env()
+	withUDPIdleFlag(t, 0)
+
+	echoConn, cleanupEcho := startUDPEcho(t)
+	defer cleanupEcho()
+	sfAddr, _, _, _ := serveTestEnv(t)
+
+	beforeC2T := gRouteBytesDirectC2T.Load()
+	beforeT2C := gRouteBytesDirectT2C.Load()
+
+	clientTCP, clientUDP, relayAddr := udpAssocEnv(t, sfAddr)
+	defer clientTCP.Close()
+
+	udpRoundtrip(t, clientUDP, relayAddr, echoConn.LocalAddr().(*net.UDPAddr))
+
+	want := int64(len("udp-idle-keepalive"))
+	waitFor(t, "direct udp route bytes settled", 3*time.Second, func() bool {
+		return gRouteBytesDirectC2T.Load() == beforeC2T+want &&
+			gRouteBytesDirectT2C.Load() == beforeT2C+want
+	})
+}
+
+// TestRouteBytesUDPProxy 验证经上游的 UDP 数据报按 payload 归因：
+// SOCKS5 封装头不计入；回包 payload 由 mock 加 2 字节前缀，双向分别核验。
+func TestRouteBytesUDPProxy(t *testing.T) {
+	init_env()
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	const prefix = "r:"
+	upstreamAddr, pktCount, cleanupUp := startMockUDPRelay(t, prefix, "", "")
+	t.Cleanup(cleanupUp)
+
+	withGlobalFlags(t, upstreamAddr, "", "")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	t.Cleanup(cleanupSF)
+
+	directBeforeC2T := gRouteBytesDirectC2T.Load()
+	directBeforeT2C := gRouteBytesDirectT2C.Load()
+
+	clientTCP, clientUDP, relayAddr := udpAssocEnv(t, sfAddr)
+	defer clientTCP.Close()
+
+	payloads := [][]byte{[]byte("ab"), []byte("cdef")} // 上行合计 6 字节
+	var wantC2T, wantT2C int64
+	for _, p := range payloads {
+		pkt, err := network.Sock5PackUDP("8.8.8.8", 53, p)
+		if err != nil {
+			t.Fatalf("PackUDP fail: %v", err)
+		}
+		if _, err := clientUDP.WriteToUDP(pkt, relayAddr); err != nil {
+			t.Fatalf("WriteToUDP fail: %v", err)
+		}
+		wantC2T += int64(len(p))
+		wantT2C += int64(len(p) + len(prefix)) // mock 回包为 prefix + data
+	}
+	for i := 0; i < len(payloads); i++ {
+		_ = clientUDP.SetReadDeadline(time.Now().Add(3 * time.Second))
+		respBuf := make([]byte, 2048)
+		if _, _, err := clientUDP.ReadFromUDP(respBuf); err != nil {
+			t.Fatalf("read reply %d fail: %v", i, err)
+		}
+	}
+
+	h := getUpstreamHealth(upstreamAddr)
+	waitFor(t, "upstream udp route bytes settled", 3*time.Second, func() bool {
+		return h.bytesC2T.Load() == wantC2T && h.bytesT2C.Load() == wantT2C
+	})
+	if pktCount.Load() != int64(len(payloads)) {
+		t.Fatalf("upstream packet count=%d, want %d", pktCount.Load(), len(payloads))
+	}
+	if gRouteBytesDirectC2T.Load() != directBeforeC2T || gRouteBytesDirectT2C.Load() != directBeforeT2C {
+		t.Errorf("direct counters must stay unchanged via upstream route: c2t %d->%d t2c %d->%d",
+			directBeforeC2T, gRouteBytesDirectC2T.Load(), directBeforeT2C, gRouteBytesDirectT2C.Load())
+	}
+}
+
+// TestStatsRendersUpstreamCounters 验证 /stats 文本包含每上游的累计字段，
+// 包括 v0.7.6 的按出口归因字节，以及 direct 汇总行。
 func TestStatsRendersUpstreamCounters(t *testing.T) {
 	resetUpstreamHealth()
 	t.Cleanup(resetUpstreamHealth)
+
+	// direct 桶是进程级累计量（跨用例不清零），写入固定值后验证渲染与上游行。
+	srv0 := strings.Fields(*servers)[0]
+	directC2T := gRouteBytesDirectC2T.Load()
+	directT2C := gRouteBytesDirectT2C.Load()
+	gRouteBytesDirectC2T.Store(4321)
+	gRouteBytesDirectT2C.Store(8765)
+	t.Cleanup(func() {
+		gRouteBytesDirectC2T.Store(directC2T)
+		gRouteBytesDirectT2C.Store(directT2C)
+	})
+	getUpstreamHealth(srv0).bytesC2T.Store(111)
+	getUpstreamHealth(srv0).bytesT2C.Store(222)
 
 	text := renderStats(time.Now())
 	for _, srv := range strings.Fields(*servers) {
@@ -3089,11 +3257,19 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		if line == "" {
 			t.Fatalf("missing upstream line for %s", srv)
 		}
-		for _, want := range []string{"attempts=0", "established=0", "connect_fails=0"} {
+		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0"}
+		if srv == srv0 {
+			wants[3] = "bytes_c2t=111"
+			wants[4] = "bytes_t2c=222"
+		}
+		for _, want := range wants {
 			if !strings.Contains(line, want) {
 				t.Errorf("upstream line missing %s: %s", want, line)
 			}
 		}
+	}
+	if !strings.Contains(text, "direct_c2t=4321 direct_t2c=8765") {
+		t.Errorf("stats text missing direct route totals:\n%s", text)
 	}
 }
 
@@ -3146,6 +3322,7 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_udp_associations_active":             "gauge",
 		"socksfilter_udp_associations_total":              "counter",
 		"socksfilter_tcp_relay_bytes_total":               "counter",
+		"socksfilter_relay_bytes_total":                   "counter",
 		"socksfilter_max_connections":                     "gauge",
 		"socksfilter_upstream_up":                         "gauge",
 		"socksfilter_upstream_consecutive_failures":       "gauge",
@@ -3183,8 +3360,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 15 {
-		t.Fatalf("expected >=15 metric samples, got %d", samples)
+	if samples < 25 {
+		t.Fatalf("expected >=25 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -3242,6 +3419,53 @@ func TestPrometheusMetricsUpstreamCounters(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+// TestPrometheusMetricsRouteBytes 验证 per-route 中继字节指标：direct 两个方向
+// 恒输出；每个上游各输出两个方向，且数值取自对应计数器。
+func TestPrometheusMetricsRouteBytes(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	srv0 := strings.Fields(*servers)[0]
+	directC2T := gRouteBytesDirectC2T.Load()
+	directT2C := gRouteBytesDirectT2C.Load()
+	gRouteBytesDirectC2T.Store(300)
+	gRouteBytesDirectT2C.Store(400)
+	t.Cleanup(func() {
+		gRouteBytesDirectC2T.Store(directC2T)
+		gRouteBytesDirectT2C.Store(directT2C)
+	})
+	getUpstreamHealth(srv0).bytesC2T.Store(500)
+	getUpstreamHealth(srv0).bytesT2C.Store(600)
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_relay_bytes_total counter") {
+		t.Fatal("missing TYPE declaration for socksfilter_relay_bytes_total")
+	}
+	for _, want := range []string{
+		`socksfilter_relay_bytes_total{route="direct",direction="client_to_target"} 300`,
+		`socksfilter_relay_bytes_total{route="direct",direction="target_to_client"} 400`,
+		fmt.Sprintf(`socksfilter_relay_bytes_total{route=%q,direction="client_to_target"} 500`, srv0),
+		fmt.Sprintf(`socksfilter_relay_bytes_total{route=%q,direction="target_to_client"} 600`, srv0),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+
+	// 其余未承载流量的上游也必须输出零值样本
+	for _, srv := range strings.Fields(*servers) {
+		if srv == srv0 {
+			continue
+		}
+		for _, dir := range []string{"client_to_target", "target_to_client"} {
+			want := fmt.Sprintf(`socksfilter_relay_bytes_total{route=%q,direction=%q} 0`, srv, dir)
+			if !strings.Contains(text, want) {
+				t.Errorf("metrics output missing zero sample %q", want)
+			}
 		}
 	}
 }

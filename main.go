@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.5"
+	version = "0.7.6"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -79,6 +79,12 @@ var (
 	gBytesClientToTarget atomic.Int64 // TCP 中继：客户端 -> 目标 累计字节
 	gBytesTargetToClient atomic.Int64 // TCP 中继：目标 -> 客户端 累计字节
 	gRejectedConns       atomic.Int64 // 因 -max-conn 上限被拒绝的会话累计数
+
+	// 按出口归因的累计中继字节（TCP 流 + UDP 数据报有效载荷，不含 SOCKS5
+	// 封装）：直连出口记入 gRouteBytesDirect*，经上游的流量记入对应
+	// upstreamHealth 的 bytesC2T/bytesT2C。c2t = client -> target。
+	gRouteBytesDirectC2T atomic.Int64
+	gRouteBytesDirectT2C atomic.Int64
 )
 
 // loadFlagsFromConfig 从 JSON 配置文件填充未在命令行显式指定的 flag。
@@ -345,6 +351,8 @@ func renderStats(now time.Time) string {
 	}
 	fmt.Fprintf(&b, "tcp_relay_bytes: client_to_target=%d target_to_client=%d\n",
 		gBytesClientToTarget.Load(), gBytesTargetToClient.Load())
+	fmt.Fprintf(&b, "route_relay_bytes(tcp+udp payload): direct_c2t=%d direct_t2c=%d\n",
+		gRouteBytesDirectC2T.Load(), gRouteBytesDirectT2C.Load())
 
 	b.WriteString("upstreams:\n")
 	for _, server := range strings.Fields(*servers) {
@@ -357,8 +365,9 @@ func renderStats(now time.Time) string {
 				state = "dead"
 			}
 		}
-		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d",
-			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load())
+		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d",
+			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
+			h.bytesC2T.Load(), h.bytesT2C.Load())
 		if state == "dead" || state == "half_open" {
 			if deadAt := h.deadAt.Load(); deadAt > 0 {
 				fmt.Fprintf(&b, " removed_since=%s", now.Sub(time.Unix(0, deadAt)).Round(time.Second))
@@ -426,6 +435,14 @@ func renderPrometheusMetrics(now time.Time) string {
 	fmt.Fprintf(&b, "socksfilter_tcp_relay_bytes_total{direction=\"%s\"} %d\n",
 		"target_to_client", gBytesTargetToClient.Load())
 
+	// 按出口归因的中继有效载荷字节（TCP 流 + UDP 数据报，不含 SOCKS5 封装）：
+	// route="direct" 为分流直连，其余标签值为具体上游地址。
+	b.WriteString("# HELP socksfilter_relay_bytes_total Cumulative payload bytes relayed per egress route (TCP streams plus UDP datagrams, excluding SOCKS5 framing); route \"direct\" is bypass traffic.\n# TYPE socksfilter_relay_bytes_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_relay_bytes_total{route=\"%s\",direction=\"%s\"} %d\n",
+		"direct", "client_to_target", gRouteBytesDirectC2T.Load())
+	fmt.Fprintf(&b, "socksfilter_relay_bytes_total{route=\"%s\",direction=\"%s\"} %d\n",
+		"direct", "target_to_client", gRouteBytesDirectT2C.Load())
+
 	b.WriteString("# HELP socksfilter_max_connections Configured concurrent session limit; 0 means unlimited.\n# TYPE socksfilter_max_connections gauge\n")
 	fmt.Fprintf(&b, "socksfilter_max_connections %d\n", *maxConn)
 
@@ -446,6 +463,11 @@ func renderPrometheusMetrics(now time.Time) string {
 		fmt.Fprintf(&b, "socksfilter_upstream_session_attempts_total%s %d\n", label, h.attempts.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_sessions_established_total%s %d\n", label, h.established.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_connect_failures_total%s %d\n", label, h.connectFails.Load())
+		routeLabel := fmt.Sprintf("{route=\"%s\"", promLabelValue(server))
+		fmt.Fprintf(&b, "socksfilter_relay_bytes_total%s,direction=\"%s\"} %d\n",
+			routeLabel, "client_to_target", h.bytesC2T.Load())
+		fmt.Fprintf(&b, "socksfilter_relay_bytes_total%s,direction=\"%s\"} %d\n",
+			routeLabel, "target_to_client", h.bytesT2C.Load())
 	}
 	return b.String()
 }
@@ -752,6 +774,11 @@ type upstreamHealth struct {
 	attempts     atomic.Int64 // 经该上游的会话建立尝试次数（TCP CONNECT / UDP ASSOCIATE）
 	established  atomic.Int64 // 会话建立成功次数（建立成功瞬间入账）
 	connectFails atomic.Int64 // 会话建立失败次数，含上游拨号/握手失败与目标不可达
+
+	// 经该上游中继的有效载荷字节（TCP 流 + UDP 数据报，不含 SOCKS5 封装）：
+	// bytesC2T 为客户端 -> 目标，bytesT2C 为目标 -> 客户端。
+	bytesC2T atomic.Int64
+	bytesT2C atomic.Int64
 }
 
 var gUpstreamHealth sync.Map // server -> *upstreamHealth
@@ -1215,7 +1242,8 @@ func (assoc *udpAssociation) handlePacket(pkt []byte) {
 	loggo.Debug("udp receive packet for target %s from client %s (data len %d)", targetAddr, assoc.clientTCPRemoteAddr, len(data))
 
 	if need_proxy(targetAddr) {
-		assoc.handleProxyPacket(targetAddr, pkt)
+		// len(data) 为去除 SOCKS5 UDP 封装后的有效载荷长度，用于按出口字节归因。
+		assoc.handleProxyPacket(targetAddr, pkt, len(data))
 	} else {
 		assoc.handleDirectPacket(targetAddr, host, port, data)
 	}
@@ -1251,6 +1279,8 @@ func (assoc *udpAssociation) handleDirectPacket(targetAddr string, host string, 
 		loggo.Info("udp direct WriteToUDP error: %s %s", targetResolvedAddr, err)
 		return
 	}
+	// 直连出口客户端 -> 目标有效载荷字节（data 已去除 SOCKS5 封装）。
+	gRouteBytesDirectC2T.Add(int64(len(data)))
 }
 
 func (assoc *udpAssociation) getOrCreateDirectConn() (*net.UDPConn, error) {
@@ -1281,6 +1311,8 @@ func (assoc *udpAssociation) getOrCreateDirectConn() (*net.UDPConn, error) {
 				return
 			}
 			assoc.lastActivity.Store(time.Now().UnixNano())
+			// 直连出口目标 -> 客户端有效载荷字节（目标返回的裸 UDP 数据报）。
+			gRouteBytesDirectT2C.Add(int64(n))
 			clientAddr := assoc.activeClientUDPAddr.Load()
 			if clientAddr == nil {
 				continue
@@ -1326,7 +1358,7 @@ func (assoc *udpAssociation) unpinTargetServer(server string) {
 	}
 }
 
-func (assoc *udpAssociation) handleProxyPacket(targetAddr string, pkt []byte) {
+func (assoc *udpAssociation) handleProxyPacket(targetAddr string, pkt []byte, payloadLen int) {
 	candidates := getCandidateServers(targetAddr, assoc.clientTCPRemoteAddr.IP.String(), assoc.clientTCPRemoteAddr.String())
 	if len(candidates) == 0 {
 		loggo.Error("udp handleProxyPacket no servers fail: %s", targetAddr)
@@ -1352,6 +1384,8 @@ func (assoc *udpAssociation) handleProxyPacket(targetAddr string, pkt []byte) {
 		}
 		// 发送成功：绑定（或故障后改绑）到该可用上游，后续包保持粘性
 		reportUpstreamSuccess(server)
+		// 经该上游客户端 -> 目标的有效载荷字节（按解包后的 payload 计，不含封装头）。
+		getUpstreamHealth(server).bytesC2T.Add(int64(payloadLen))
 		if server != pinned {
 			assoc.setPinTargetServer(targetAddr, server)
 		}
@@ -1466,6 +1500,11 @@ func (assoc *udpAssociation) getOrCreateUpstreamSession(server string) (*udpUpst
 				return
 			}
 			assoc.lastActivity.Store(time.Now().UnixNano())
+			// 上游回包为 SOCKS5 UDP 封装帧，按解包后的有效载荷计入目标 -> 客户端；
+			// 解包失败的畸形帧仍透传给客户端，但不参与字节归因。
+			if _, _, data, uerr := network.Sock5UnpackUDP(buf[:n]); uerr == nil {
+				h.bytesT2C.Add(int64(len(data)))
+			}
 			clientAddr := assoc.activeClientUDPAddr.Load()
 			if clientAddr == nil {
 				continue
@@ -1683,7 +1722,7 @@ func process_proxy_server(ctx context.Context, conn *net.TCPConn, targetAddr str
 
 	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
-	relay(ctx, conn, proxyconn)
+	relay(ctx, conn, proxyconn, &h.bytesC2T, &h.bytesT2C)
 
 	return true
 }
@@ -1717,10 +1756,10 @@ func process_direct(ctx context.Context, conn *net.TCPConn, targetAddr string) {
 
 	loggo.Info("process_direct client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
 
-	relay(ctx, conn, targetconn)
+	relay(ctx, conn, targetconn, &gRouteBytesDirectC2T, &gRouteBytesDirectT2C)
 }
 
-func relay(ctx context.Context, c1, c2 *net.TCPConn) {
+func relay(ctx context.Context, c1, c2 *net.TCPConn, routeC2T, routeT2C *atomic.Int64) {
 	var closeOnce sync.Once
 	closeBoth := func() {
 		_ = c1.Close()
@@ -1744,8 +1783,9 @@ func relay(ctx context.Context, c1, c2 *net.TCPConn) {
 
 	errCh := make(chan error, 2)
 	// c1 为客户端连接、c2 为目标（直连或上游）连接，分别累计两个方向的中继字节。
-	go proxy(c1, c2, c1.RemoteAddr().String(), c2.RemoteAddr().String(), errCh, idle, &lastActivity, &gBytesClientToTarget)
-	go proxy(c2, c1, c2.RemoteAddr().String(), c1.RemoteAddr().String(), errCh, idle, &lastActivity, &gBytesTargetToClient)
+	// 全局口径（仅 TCP）与按出口归因口径（TCP+UDP 共用同一组路由计数器）同时入账。
+	go proxy(c1, c2, c1.RemoteAddr().String(), c2.RemoteAddr().String(), errCh, idle, &lastActivity, &gBytesClientToTarget, routeC2T)
+	go proxy(c2, c1, c2.RemoteAddr().String(), c1.RemoteAddr().String(), errCh, idle, &lastActivity, &gBytesTargetToClient, routeT2C)
 
 	for i := 0; i < 2; i++ {
 		err := <-errCh
@@ -1756,7 +1796,7 @@ func relay(ctx context.Context, c1, c2 *net.TCPConn) {
 	closeOnce.Do(closeBoth)
 }
 
-func proxy(destination *net.TCPConn, source *net.TCPConn, dst string, src string, errCh chan error, idle time.Duration, lastActivity *atomic.Int64, byteCounter *atomic.Int64) {
+func proxy(destination *net.TCPConn, source *net.TCPConn, dst string, src string, errCh chan error, idle time.Duration, lastActivity *atomic.Int64, byteCounter *atomic.Int64, routeCounter *atomic.Int64) {
 	loggo.Debug("transfer client begin transfer from %s -> %s", src, dst)
 	var reader io.Reader = source
 	if idle > 0 {
@@ -1765,6 +1805,9 @@ func proxy(destination *net.TCPConn, source *net.TCPConn, dst string, src string
 	n, err := io.Copy(destination, reader)
 	if byteCounter != nil {
 		byteCounter.Add(n)
+	}
+	if routeCounter != nil {
+		routeCounter.Add(n)
 	}
 	_ = destination.CloseWrite()
 	errCh <- err
