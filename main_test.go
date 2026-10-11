@@ -2569,6 +2569,7 @@ func TestStatsHTTPEndpoint(t *testing.T) {
 		"tcp_relay_bytes: client_to_target=",
 		"route_relay_bytes(tcp+udp payload): direct_c2t=",
 		"route_sessions(tcp+udp): direct_active=",
+		"dns_lookups: literal=",
 		"upstreams:",
 	} {
 		if !strings.Contains(text, want) {
@@ -3384,6 +3385,76 @@ func TestRouteSessionsUDPProxy(t *testing.T) {
 	}
 }
 
+// TestDNSResolveObservability 验证 resolveRouteIP 的 DNS 观测埋点：
+// IP 字面量目标计入 literal；host/root 两级缓存命中计入 cache_hit。
+// 仅使用无网络路径，保证用例确定可复现。
+func TestDNSResolveObservability(t *testing.T) {
+	init_env()
+
+	beforeLiteral := gDNSLookupsLiteral.Load()
+	beforeCacheHit := gDNSLookupsCacheHit.Load()
+	beforeResolved := gDNSLookupsResolved.Load()
+	beforeFailure := gDNSLookupsFailure.Load()
+
+	// 1) IP 字面量：不查缓存/网络
+	ip, ok := resolveRouteIP("1.2.3.4", "1.2.3.4")
+	if !ok || ip != "1.2.3.4" {
+		t.Fatalf("literal resolve = %q,%v", ip, ok)
+	}
+
+	// 2) host 精确缓存命中
+	gDnsCache.Set("dns-obs-host.example.com", "5.6.7.8")
+	ip, ok = resolveRouteIP("dns-obs-host.example.com", "dns-obs-host.example.com")
+	if !ok || ip != "5.6.7.8" {
+		t.Fatalf("host cache resolve = %q,%v", ip, ok)
+	}
+
+	// 3) root 域缓存命中（子域名未单独缓存）
+	gDnsCache.Set("dns-obs-root.example.net", "9.10.11.12")
+	ip, ok = resolveRouteIP("www.dns-obs-root.example.net", "dns-obs-root.example.net")
+	if !ok || ip != "9.10.11.12" {
+		t.Fatalf("root cache resolve = %q,%v", ip, ok)
+	}
+
+	if got := gDNSLookupsLiteral.Load(); got != beforeLiteral+1 {
+		t.Errorf("literal lookups=%d, want +1 (before %d)", got, beforeLiteral)
+	}
+	if got := gDNSLookupsCacheHit.Load(); got != beforeCacheHit+2 {
+		t.Errorf("cache_hit lookups=%d, want +2 (before %d)", got, beforeCacheHit)
+	}
+	if got := gDNSLookupsResolved.Load(); got != beforeResolved {
+		t.Errorf("resolved lookups=%d, want unchanged %d", got, beforeResolved)
+	}
+	if got := gDNSLookupsFailure.Load(); got != beforeFailure {
+		t.Errorf("failure lookups=%d, want unchanged %d", got, beforeFailure)
+	}
+}
+
+// TestDNSObservabilityProxyLiteralE2E 验证真实代理会话对 IP 目标做分流判定时
+// 计入一次 literal lookup（8.8.8.8:53 无需 DNS）。
+func TestDNSObservabilityProxyLiteralE2E(t *testing.T) {
+	init_env()
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	echoAddr, cleanupEcho := startEchoTCP(t)
+	t.Cleanup(cleanupEcho)
+	upstreamAddr, cleanupUp := startAuthConnectUpstream(t, "", "", echoAddr)
+	t.Cleanup(cleanupUp)
+
+	withGlobalFlags(t, upstreamAddr, "", "")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	t.Cleanup(cleanupSF)
+
+	before := gDNSLookupsLiteral.Load()
+	client := proxyRequestOnce(t, sfAddr)
+	_ = client.Close()
+
+	waitFor(t, "literal dns lookup counted", 3*time.Second, func() bool {
+		return gDNSLookupsLiteral.Load() == before+1
+	})
+}
+
 // TestStatsRendersUpstreamCounters 验证 /stats 文本包含每上游的累计字段，
 // 包括 v0.7.6 的按出口归因字节、v0.7.7 的按出口归因会话，以及 direct 汇总行。
 func TestStatsRendersUpstreamCounters(t *testing.T) {
@@ -3445,6 +3516,38 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	}
 }
 
+// TestStatsRendersDNSCounters 验证 /stats 的两行 DNS 指标按计数器现值渲染。
+func TestStatsRendersDNSCounters(t *testing.T) {
+	saved := [6]int64{
+		gDNSLookupsLiteral.Load(), gDNSLookupsCacheHit.Load(), gDNSLookupsResolved.Load(),
+		gDNSLookupsFailure.Load(), gDNSResolveSmart.Load(), gDNSResolveFallback.Load(),
+	}
+	gDNSLookupsLiteral.Store(101)
+	gDNSLookupsCacheHit.Store(202)
+	gDNSLookupsResolved.Store(303)
+	gDNSLookupsFailure.Store(4)
+	gDNSResolveSmart.Store(250)
+	gDNSResolveFallback.Store(53)
+	t.Cleanup(func() {
+		gDNSLookupsLiteral.Store(saved[0])
+		gDNSLookupsCacheHit.Store(saved[1])
+		gDNSLookupsResolved.Store(saved[2])
+		gDNSLookupsFailure.Store(saved[3])
+		gDNSResolveSmart.Store(saved[4])
+		gDNSResolveFallback.Store(saved[5])
+	})
+
+	text := renderStats(time.Now())
+	for _, want := range []string{
+		"dns_lookups: literal=101 cache_hit=202 resolved=303 failure=4",
+		"dns_resolved_source: smart_resolver=250 system_fallback=53 cache_entries=",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("stats text missing %q:\n%s", want, text)
+		}
+	}
+}
+
 // ---- Prometheus /metrics ----
 
 // validPromMetricName 校验指标名满足 Prometheus 词法 [a-zA-Z_:][a-zA-Z0-9_:]*。
@@ -3497,6 +3600,9 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_relay_bytes_total":                   "counter",
 		"socksfilter_route_sessions_active":               "gauge",
 		"socksfilter_route_sessions_total":                "counter",
+		"socksfilter_dns_lookups_total":                   "counter",
+		"socksfilter_dns_resolutions_total":               "counter",
+		"socksfilter_dns_cache_entries":                   "gauge",
 		"socksfilter_max_connections":                     "gauge",
 		"socksfilter_upstream_up":                         "gauge",
 		"socksfilter_upstream_consecutive_failures":       "gauge",
@@ -3534,8 +3640,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 33 {
-		t.Fatalf("expected >=33 metric samples, got %d", samples)
+	if samples < 40 {
+		t.Fatalf("expected >=40 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -3698,6 +3804,49 @@ func TestPrometheusMetricsRouteSessions(t *testing.T) {
 				t.Errorf("metrics output missing zero sample %q", want)
 			}
 		}
+	}
+}
+
+// TestPrometheusMetricsDNSCounters 验证 DNS 三个指标族：lookup 四种结果、
+// resolution 两种来源、cache_entries gauge，数值取自对应计数器。
+func TestPrometheusMetricsDNSCounters(t *testing.T) {
+	saved := [6]int64{
+		gDNSLookupsLiteral.Load(), gDNSLookupsCacheHit.Load(), gDNSLookupsResolved.Load(),
+		gDNSLookupsFailure.Load(), gDNSResolveSmart.Load(), gDNSResolveFallback.Load(),
+	}
+	gDNSLookupsLiteral.Store(11)
+	gDNSLookupsCacheHit.Store(22)
+	gDNSLookupsResolved.Store(33)
+	gDNSLookupsFailure.Store(5)
+	gDNSResolveSmart.Store(27)
+	gDNSResolveFallback.Store(6)
+	t.Cleanup(func() {
+		gDNSLookupsLiteral.Store(saved[0])
+		gDNSLookupsCacheHit.Store(saved[1])
+		gDNSLookupsResolved.Store(saved[2])
+		gDNSLookupsFailure.Store(saved[3])
+		gDNSResolveSmart.Store(saved[4])
+		gDNSResolveFallback.Store(saved[5])
+	})
+
+	text := renderPrometheusMetrics(time.Now())
+	for _, want := range []string{
+		"# TYPE socksfilter_dns_lookups_total counter",
+		`socksfilter_dns_lookups_total{outcome="literal"} 11`,
+		`socksfilter_dns_lookups_total{outcome="cache_hit"} 22`,
+		`socksfilter_dns_lookups_total{outcome="resolved"} 33`,
+		`socksfilter_dns_lookups_total{outcome="failure"} 5`,
+		"# TYPE socksfilter_dns_resolutions_total counter",
+		`socksfilter_dns_resolutions_total{source="smart_resolver"} 27`,
+		`socksfilter_dns_resolutions_total{source="system_fallback"} 6`,
+		"# TYPE socksfilter_dns_cache_entries gauge",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+	if !strings.Contains(text, "socksfilter_dns_cache_entries ") {
+		t.Errorf("metrics output missing dns_cache_entries sample:\n%s", text)
 	}
 }
 

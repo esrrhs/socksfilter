@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.7"
+	version = "0.7.8"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -91,6 +91,16 @@ var (
 	// upstreamHealth.sessionsActive，累计建立数复用 established。
 	gRouteSessionsTotalDirect  atomic.Int64
 	gRouteSessionsActiveDirect atomic.Int64
+
+	// DNS 分流解析观测，埋点在统一入口 resolveRouteIP：
+	// 每次域名路由解析按结果四选一计入 gDNSLookups*；IP 字面量目标不查 DNS。
+	// gDNSResolveSmart/Fallback 对实际解析成功的来源做细分（二者之和=resolved）。
+	gDNSLookupsLiteral  atomic.Int64 // 目标本身是 IP 字面量，无需解析
+	gDNSLookupsCacheHit atomic.Int64 // 命中 gDnsCache（host 或 root 域）
+	gDNSLookupsResolved atomic.Int64 // 缓存未命中后实际发起解析且成功
+	gDNSLookupsFailure  atomic.Int64 // 所有解析路径均失败（按既有行为回退直连）
+	gDNSResolveSmart    atomic.Int64 // gResolver 防污染智能解析成功
+	gDNSResolveFallback atomic.Int64 // common.ResolveDomainToIP 系统/DoH 兜底成功
 )
 
 // loadFlagsFromConfig 从 JSON 配置文件填充未在命令行显式指定的 flag。
@@ -361,6 +371,11 @@ func renderStats(now time.Time) string {
 		gRouteBytesDirectC2T.Load(), gRouteBytesDirectT2C.Load())
 	fmt.Fprintf(&b, "route_sessions(tcp+udp): direct_active=%d direct_total=%d\n",
 		gRouteSessionsActiveDirect.Load(), gRouteSessionsTotalDirect.Load())
+	fmt.Fprintf(&b, "dns_lookups: literal=%d cache_hit=%d resolved=%d failure=%d\n",
+		gDNSLookupsLiteral.Load(), gDNSLookupsCacheHit.Load(),
+		gDNSLookupsResolved.Load(), gDNSLookupsFailure.Load())
+	fmt.Fprintf(&b, "dns_resolved_source: smart_resolver=%d system_fallback=%d cache_entries=%d\n",
+		gDNSResolveSmart.Load(), gDNSResolveFallback.Load(), dnsCacheSize())
 
 	b.WriteString("upstreams:\n")
 	for _, server := range strings.Fields(*servers) {
@@ -460,6 +475,19 @@ func renderPrometheusMetrics(now time.Time) string {
 	b.WriteString("# HELP socksfilter_route_sessions_total Total sessions established via this egress route (TCP CONNECT tunnels and UDP sessions).\n# TYPE socksfilter_route_sessions_total counter\n")
 	fmt.Fprintf(&b, "socksfilter_route_sessions_total{route=\"%s\"} %d\n",
 		"direct", gRouteSessionsTotalDirect.Load())
+
+	// DNS 分流解析：lookup 按结果互斥分类（literal 为 IP 字面量目标，不查 DNS）；
+	// resolution 按实际解析成功的来源细分；cache_entries 为当前缓存条目 gauge。
+	b.WriteString("# HELP socksfilter_dns_lookups_total Route-resolution lookups by outcome; \"literal\" targets are IPs needing no DNS, the rest are domain lookups.\n# TYPE socksfilter_dns_lookups_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_dns_lookups_total{outcome=\"%s\"} %d\n", "literal", gDNSLookupsLiteral.Load())
+	fmt.Fprintf(&b, "socksfilter_dns_lookups_total{outcome=\"%s\"} %d\n", "cache_hit", gDNSLookupsCacheHit.Load())
+	fmt.Fprintf(&b, "socksfilter_dns_lookups_total{outcome=\"%s\"} %d\n", "resolved", gDNSLookupsResolved.Load())
+	fmt.Fprintf(&b, "socksfilter_dns_lookups_total{outcome=\"%s\"} %d\n", "failure", gDNSLookupsFailure.Load())
+	b.WriteString("# HELP socksfilter_dns_resolutions_total Successful on-demand domain resolutions by source (smart_resolver or system_fallback).\n# TYPE socksfilter_dns_resolutions_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_dns_resolutions_total{source=\"%s\"} %d\n", "smart_resolver", gDNSResolveSmart.Load())
+	fmt.Fprintf(&b, "socksfilter_dns_resolutions_total{source=\"%s\"} %d\n", "system_fallback", gDNSResolveFallback.Load())
+	b.WriteString("# HELP socksfilter_dns_cache_entries Current entries held in the route DNS cache.\n# TYPE socksfilter_dns_cache_entries gauge\n")
+	fmt.Fprintf(&b, "socksfilter_dns_cache_entries %d\n", dnsCacheSize())
 
 	b.WriteString("# HELP socksfilter_max_connections Configured concurrent session limit; 0 means unlimited.\n# TYPE socksfilter_max_connections gauge\n")
 	fmt.Fprintf(&b, "socksfilter_max_connections %d\n", *maxConn)
@@ -643,14 +671,17 @@ var cgnatNet = func() *net.IPNet {
 // 解析结果统一回填 gDnsCache，保证 TCP/UDP 的分流判定与实际拨号使用同一 IP。
 func resolveRouteIP(host, rootHost string) (string, bool) {
 	if common.IsValidIP(rootHost) {
+		gDNSLookupsLiteral.Add(1)
 		return rootHost, true
 	}
 
 	if cacheAddr, ok := gDnsCache.Get(host); ok && cacheAddr != "" {
+		gDNSLookupsCacheHit.Add(1)
 		loggo.Info("need_proxy cache hit: %s %v", host, cacheAddr)
 		return cacheAddr, true
 	}
 	if rootCacheAddr, ok := gDnsCache.Get(rootHost); ok && rootCacheAddr != "" {
+		gDNSLookupsCacheHit.Add(1)
 		loggo.Info("need_proxy cache root hit: %s %v", rootHost, rootCacheAddr)
 		return rootCacheAddr, true
 	}
@@ -659,6 +690,8 @@ func resolveRouteIP(host, rootHost string) (string, bool) {
 		if ip, err := gResolver.ResolveOne(context.Background(), rootHost); err == nil && ip != nil {
 			taddr := ip.String()
 			gDnsCache.Set(rootHost, taddr)
+			gDNSLookupsResolved.Add(1)
+			gDNSResolveSmart.Add(1)
 			loggo.Info("need_proxy cache root set via gResolver: %s %s", rootHost, taddr)
 			return taddr, true
 		} else if err != nil {
@@ -668,6 +701,8 @@ func resolveRouteIP(host, rootHost string) (string, bool) {
 
 	if taddr, err := common.ResolveDomainToIP(rootHost); err == nil {
 		gDnsCache.Set(rootHost, taddr)
+		gDNSLookupsResolved.Add(1)
+		gDNSResolveFallback.Add(1)
 		loggo.Info("need_proxy cache root set: %s %s size %v", rootHost, taddr, gDnsCache.Size())
 		return taddr, true
 	} else {
@@ -676,13 +711,24 @@ func resolveRouteIP(host, rootHost string) (string, bool) {
 
 	if taddr, err := common.ResolveDomainToIP(host); err == nil {
 		gDnsCache.Set(host, taddr)
+		gDNSLookupsResolved.Add(1)
+		gDNSResolveFallback.Add(1)
 		loggo.Info("need_proxy cache set: %s %s size %v", host, taddr, gDnsCache.Size())
 		return taddr, true
 	} else {
 		loggo.Error("need_proxy ResolveDomainToIP error: %s %s", host, err)
 	}
 
+	gDNSLookupsFailure.Add(1)
 	return "", false
+}
+
+// dnsCacheSize 返回当前 DNS 缓存条目数；init_env 未执行（如纯渲染测试）时为 0。
+func dnsCacheSize() int64 {
+	if gDnsCache == nil {
+		return 0
+	}
+	return int64(gDnsCache.Size())
 }
 
 func need_proxy(addr string) bool {
