@@ -4144,6 +4144,7 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_entry_errors_total":                          "counter",
 		"socksfilter_max_connections":                             "gauge",
 		"socksfilter_upstream_up":                                 "gauge",
+		"socksfilter_upstream_health_state":                       "gauge",
 		"socksfilter_upstream_consecutive_failures":               "gauge",
 		"socksfilter_upstream_session_attempts_total":             "counter",
 		"socksfilter_upstream_sessions_established_total":         "counter",
@@ -4184,8 +4185,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 114 {
-		t.Fatalf("expected >=114 metric samples, got %d", samples)
+	if samples < 123 {
+		t.Fatalf("expected >=123 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -4621,6 +4622,64 @@ func TestPrometheusMetricsTrafficFailures(t *testing.T) {
 			if !strings.Contains(text, want) {
 				t.Errorf("metrics output missing zero sample %q", want)
 			}
+		}
+	}
+}
+
+// TestPrometheusMetricsHealthState 验证三态健康 gauge：每个上游恰好一个
+// state 标签值为 1（one-hot），且与二元 up gauge 一致（alive/half_open
+// 为 1，dead 为 0）。三态各造一个上游：默认 alive、刚摘除 dead、摘除
+// 已超过冷却窗口的 half_open（用固定 deadAt 构造，不改全局冷却）。
+func TestPrometheusMetricsHealthState(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+	oldServers := *servers
+	srvAlive, srvDead, srvHalf := "127.0.0.1:2001", "127.0.0.1:2002", "127.0.0.1:2003"
+	*servers = srvAlive + " " + srvDead + " " + srvHalf
+	t.Cleanup(func() { *servers = oldServers })
+
+	now := time.Now()
+	oldCooldown := gHealthCooldown.Load()
+	gHealthCooldown.Store(int64(10 * time.Second))
+	t.Cleanup(func() { gHealthCooldown.Store(oldCooldown) })
+	getUpstreamHealth(srvAlive) // 默认即 alive
+	dh := getUpstreamHealth(srvDead)
+	dh.alive.Store(false)
+	dh.deadAt.Store(now.UnixNano())
+	hh := getUpstreamHealth(srvHalf)
+	hh.alive.Store(false)
+	hh.deadAt.Store(now.Add(-time.Hour).UnixNano()) // 默认冷却 10s，早已过期 -> half_open
+
+	text := renderPrometheusMetrics(now)
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_health_state gauge") {
+		t.Fatal("missing TYPE declaration for socksfilter_upstream_health_state")
+	}
+	wantStates := map[string]string{
+		srvAlive: "alive",
+		srvDead:  "dead",
+		srvHalf:  "half_open",
+	}
+	wantUp := map[string]int{srvAlive: 1, srvDead: 0, srvHalf: 1}
+	for srv, state := range wantStates {
+		ones := 0
+		for _, st := range upstreamHealthStates {
+			line := fmt.Sprintf(`socksfilter_upstream_health_state{upstream=%q,state=%q}`, srv, st)
+			if !strings.Contains(text, line+" ") {
+				t.Fatalf("missing sample %q", line)
+			}
+			if strings.Contains(text, line+" 1") {
+				ones++
+				if st != state {
+					t.Errorf("%s reports state=%s as 1, want %s", srv, st, state)
+				}
+			}
+		}
+		if ones != 1 {
+			t.Errorf("%s one-hot state count=%d, want exactly 1", srv, ones)
+		}
+		upLine := fmt.Sprintf("socksfilter_upstream_up{upstream=%q} %d", srv, wantUp[srv])
+		if !strings.Contains(text, upLine) {
+			t.Errorf("missing/ inconsistent up sample %q", upLine)
 		}
 	}
 }

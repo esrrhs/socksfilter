@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.16"
+	version = "0.7.17"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -521,6 +521,7 @@ func renderPrometheusMetrics(now time.Time) string {
 	fmt.Fprintf(&b, "socksfilter_max_connections %d\n", *maxConn)
 
 	b.WriteString("# HELP socksfilter_upstream_up 1 if the upstream can serve traffic (alive or half-open probe), 0 if removed.\n# TYPE socksfilter_upstream_up gauge\n")
+	b.WriteString("# HELP socksfilter_upstream_health_state Current three-way health state of the upstream; exactly one state per upstream is 1 (one-hot): alive serves traffic, half_open is removed but past the probe cooldown and eligible for trial routing, dead is removed and inside the cooldown window.\n# TYPE socksfilter_upstream_health_state gauge\n")
 	b.WriteString("# HELP socksfilter_upstream_consecutive_failures Consecutive passive health failures counted since the last success (0 on healthy).\n# TYPE socksfilter_upstream_consecutive_failures gauge\n")
 	b.WriteString("# HELP socksfilter_upstream_session_attempts_total Total session establishment attempts via this upstream (TCP CONNECT plus UDP ASSOCIATE; reused UDP sessions not recounted).\n# TYPE socksfilter_upstream_session_attempts_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_sessions_established_total Total sessions established successfully via this upstream.\n# TYPE socksfilter_upstream_sessions_established_total counter\n")
@@ -538,6 +539,15 @@ func renderPrometheusMetrics(now time.Time) string {
 		}
 		label := fmt.Sprintf("{upstream=\"%s\"}", promLabelValue(server))
 		fmt.Fprintf(&b, "socksfilter_upstream_up%s %d\n", label, up)
+		currentState := h.state(now)
+		for _, st := range upstreamHealthStates {
+			v := 0
+			if st == currentState {
+				v = 1
+			}
+			fmt.Fprintf(&b, "socksfilter_upstream_health_state{upstream=\"%s\",state=\"%s\"} %d\n",
+				promLabelValue(server), st, v)
+		}
 		fmt.Fprintf(&b, "socksfilter_upstream_consecutive_failures%s %d\n", label, h.fails.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_session_attempts_total%s %d\n", label, h.attempts.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_sessions_established_total%s %d\n", label, h.established.Load())
@@ -997,6 +1007,10 @@ var trafficFailStages = []string{
 	trafficFailStageRequest,
 	trafficFailStageWrite,
 }
+
+// upstreamHealthStates 为三态健康 gauge 的固定标签顺序，与
+// upstreamHealth.state(now) 的取值一一对应。
+var upstreamHealthStates = []string{"alive", "half_open", "dead"}
 
 // probeLatencyUpperBounds 为主动探测延迟直方图的有限桶上界（秒），对齐
 // Prometheus 默认延迟桶；超过最后一个上界的观测仅计入 +Inf 桶。
