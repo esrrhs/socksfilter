@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.9"
+	version = "0.7.10"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -106,6 +106,12 @@ var (
 	// -udp-idle-timeout 是否过短误伤、或过长无法清理僵尸会话）。
 	gIdleClosedTCP atomic.Int64 // TCP 隧道双向静默超时
 	gIdleClosedUDP atomic.Int64 // UDP 关联双向静默超时
+
+	// SOCKS5 入口协议错误累计数（发生在会话建立/准入之前，不计入连接与会话
+	// 指标）：可用于发现端口扫描、错误凭据探测或不兼容客户端。
+	gEntryErrHandshake      atomic.Int64 // 方法协商/用户名密码认证失败（含非 SOCKS5 流量）
+	gEntryErrBadRequest     atomic.Int64 // 握手通过但 CONNECT/UDP 请求帧解析失败
+	gEntryErrUnsupportedCmd atomic.Int64 // 请求命令既非 CONNECT 也非 UDP ASSOCIATE
 )
 
 // loadFlagsFromConfig 从 JSON 配置文件填充未在命令行显式指定的 flag。
@@ -383,6 +389,8 @@ func renderStats(now time.Time) string {
 		gDNSResolveSmart.Load(), gDNSResolveFallback.Load(), dnsCacheSize())
 	fmt.Fprintf(&b, "idle_timeout_closed: tcp=%d udp=%d\n",
 		gIdleClosedTCP.Load(), gIdleClosedUDP.Load())
+	fmt.Fprintf(&b, "entry_errors: handshake=%d bad_request=%d unsupported_command=%d\n",
+		gEntryErrHandshake.Load(), gEntryErrBadRequest.Load(), gEntryErrUnsupportedCmd.Load())
 
 	b.WriteString("upstreams:\n")
 	for _, server := range strings.Fields(*servers) {
@@ -500,6 +508,12 @@ func renderPrometheusMetrics(now time.Time) string {
 	b.WriteString("# HELP socksfilter_idle_timeout_closed_total Sessions closed locally after bidirectional idle timeout (tcp tunnels and udp associations).\n# TYPE socksfilter_idle_timeout_closed_total counter\n")
 	fmt.Fprintf(&b, "socksfilter_idle_timeout_closed_total{transport=\"%s\"} %d\n", "tcp", gIdleClosedTCP.Load())
 	fmt.Fprintf(&b, "socksfilter_idle_timeout_closed_total{transport=\"%s\"} %d\n", "udp", gIdleClosedUDP.Load())
+
+	// SOCKS5 入口协议错误（会话建立前被拒）：握手/认证失败、畸形请求、不支持的命令。
+	b.WriteString("# HELP socksfilter_entry_errors_total Client connections rejected before a session was admitted, by SOCKS5 entry-stage reason.\n# TYPE socksfilter_entry_errors_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_entry_errors_total{reason=\"%s\"} %d\n", "handshake", gEntryErrHandshake.Load())
+	fmt.Fprintf(&b, "socksfilter_entry_errors_total{reason=\"%s\"} %d\n", "bad_request", gEntryErrBadRequest.Load())
+	fmt.Fprintf(&b, "socksfilter_entry_errors_total{reason=\"%s\"} %d\n", "unsupported_command", gEntryErrUnsupportedCmd.Load())
 
 	b.WriteString("# HELP socksfilter_max_connections Configured concurrent session limit; 0 means unlimited.\n# TYPE socksfilter_max_connections gauge\n")
 	fmt.Fprintf(&b, "socksfilter_max_connections %d\n", *maxConn)
@@ -1161,11 +1175,23 @@ func process(ctx context.Context, conn *net.TCPConn) {
 	var err error = nil
 	if err = network.Sock5HandshakeBy(conn, *username, *password); err != nil {
 		loggo.Error("process socks handshake: %s", err)
+		gEntryErrHandshake.Add(1)
 		return
 	}
 	cmd, _, targetAddr, err := network.Sock5GetRequest(conn)
 	if err != nil {
-		loggo.Error("process error getting request: %s", err)
+		// gohome 的请求解析会直接拒绝 CONNECT/UDP-ASSOCIATE 以外的命令
+		//（错误文本 "socks command not supported"，版本锁定在 go.mod）：
+		// 与帧不完整/版本错误等畸形请求区分开，并按 RFC 回 0x07 命令不支持，
+		// 而不是让客户端只看到连接重置。
+		if strings.Contains(err.Error(), "command not supported") {
+			loggo.Error("process unsupported socks command in request: %s", err)
+			gEntryErrUnsupportedCmd.Add(1)
+			_ = network.Sock5SendConnectReply(conn, 0x07, "0.0.0.0:0")
+		} else {
+			loggo.Error("process error getting request: %s", err)
+			gEntryErrBadRequest.Add(1)
+		}
 		return
 	}
 
@@ -1198,6 +1224,7 @@ func process(ctx context.Context, conn *net.TCPConn) {
 		process_udp(ctx, conn, targetAddr)
 	} else {
 		loggo.Error("process unsupported socks command: %d", cmd)
+		gEntryErrUnsupportedCmd.Add(1)
 		_ = network.Sock5SendConnectReply(conn, 0x07, "0.0.0.0:0")
 	}
 }

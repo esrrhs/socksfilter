@@ -2571,6 +2571,7 @@ func TestStatsHTTPEndpoint(t *testing.T) {
 		"route_sessions(tcp+udp): direct_active=",
 		"dns_lookups: literal=",
 		"idle_timeout_closed: tcp=",
+		"entry_errors: handshake=",
 		"upstreams:",
 	} {
 		if !strings.Contains(text, want) {
@@ -3571,6 +3572,84 @@ func TestIdleClosedUDPCounter(t *testing.T) {
 	})
 }
 
+// withLocalAuth 临时开启 SOCKS5 入口用户名/密码认证，测试结束自动还原。
+func withLocalAuth(t *testing.T, user, pass string) {
+	t.Helper()
+	oldUser, oldPass := *username, *password
+	*username, *password = user, pass
+	t.Cleanup(func() { *username, *password = oldUser, oldPass })
+}
+
+// TestEntryErrorHandshakeCounter 验证开启本地认证后，错误凭据握手失败计一次
+// handshake 入口错误。注意：auth flag 是普通 *string，必须在启动监听器之前设置，
+// 否则与 process goroutine 的无锁读取构成数据竞争。
+func TestEntryErrorHandshakeCounter(t *testing.T) {
+	withLocalAuth(t, "obs-user", "obs-pass")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	defer cleanupSF()
+
+	before := gEntryErrHandshake.Load()
+	c, err := net.DialTCP("tcp", nil, mustTCPAddr(t, sfAddr))
+	if err != nil {
+		t.Fatalf("dial fail: %v", err)
+	}
+	if err := network.Sock5Handshake(c, 2000, "obs-user", "wrong-pass"); err == nil {
+		t.Fatal("expected handshake failure with wrong password")
+	}
+	_ = c.Close()
+	waitFor(t, "handshake error counted", 3*time.Second, func() bool {
+		return gEntryErrHandshake.Load() == before+1
+	})
+}
+
+// TestEntryErrorBadRequestAndUnsupportedCmd 验证握手通过后的两类入口错误：
+// 残缺请求帧计 bad_request；BIND（0x02）收到 0x07 应答并计 unsupported_command。
+func TestEntryErrorBadRequestAndUnsupportedCmd(t *testing.T) {
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	defer cleanupSF()
+
+	// 1) 畸形请求：方法协商通过后只发 2 字节残缺请求帧再关闭
+	beforeBad := gEntryErrBadRequest.Load()
+	c2, err := net.DialTCP("tcp", nil, mustTCPAddr(t, sfAddr))
+	if err != nil {
+		t.Fatalf("dial fail: %v", err)
+	}
+	if err := network.Sock5Handshake(c2, 2000, "", ""); err != nil {
+		t.Fatalf("handshake fail: %v", err)
+	}
+	if _, err := c2.Write([]byte{0x05, 0x01}); err != nil {
+		t.Fatalf("write truncated request fail: %v", err)
+	}
+	_ = c2.Close()
+	waitFor(t, "bad request counted", 3*time.Second, func() bool {
+		return gEntryErrBadRequest.Load() == beforeBad+1
+	})
+
+	// 2) 不支持的命令（BIND=0x02）：应收到 0x07 失败应答并计数
+	beforeCmd := gEntryErrUnsupportedCmd.Load()
+	c3, err := net.DialTCP("tcp", nil, mustTCPAddr(t, sfAddr))
+	if err != nil {
+		t.Fatalf("dial fail: %v", err)
+	}
+	if err := network.Sock5Handshake(c3, 2000, "", ""); err != nil {
+		t.Fatalf("handshake fail: %v", err)
+	}
+	if _, err := c3.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatalf("write bind request fail: %v", err)
+	}
+	rep := make([]byte, 10)
+	if _, err := io.ReadFull(c3, rep); err != nil {
+		t.Fatalf("read bind reply fail: %v", err)
+	}
+	if rep[1] != 0x07 {
+		t.Fatalf("expected command-not-supported reply 0x07, got %#x", rep[1])
+	}
+	_ = c3.Close()
+	waitFor(t, "unsupported command counted", 3*time.Second, func() bool {
+		return gEntryErrUnsupportedCmd.Load() == beforeCmd+1
+	})
+}
+
 // TestStatsRendersDNSCounters 验证 /stats 的两行 DNS 指标按计数器现值渲染。
 func TestStatsRendersDNSCounters(t *testing.T) {
 	saved := [6]int64{
@@ -3617,6 +3696,24 @@ func TestStatsRendersIdleCounters(t *testing.T) {
 	text := renderStats(time.Now())
 	if !strings.Contains(text, "idle_timeout_closed: tcp=31 udp=17") {
 		t.Errorf("stats text missing idle counters:\n%s", text)
+	}
+}
+
+// TestStatsRendersEntryErrors 验证 /stats 的入口错误行按计数器现值渲染。
+func TestStatsRendersEntryErrors(t *testing.T) {
+	saved := [3]int64{gEntryErrHandshake.Load(), gEntryErrBadRequest.Load(), gEntryErrUnsupportedCmd.Load()}
+	gEntryErrHandshake.Store(41)
+	gEntryErrBadRequest.Store(5)
+	gEntryErrUnsupportedCmd.Store(2)
+	t.Cleanup(func() {
+		gEntryErrHandshake.Store(saved[0])
+		gEntryErrBadRequest.Store(saved[1])
+		gEntryErrUnsupportedCmd.Store(saved[2])
+	})
+
+	text := renderStats(time.Now())
+	if !strings.Contains(text, "entry_errors: handshake=41 bad_request=5 unsupported_command=2") {
+		t.Errorf("stats text missing entry error counters:\n%s", text)
 	}
 }
 
@@ -3676,6 +3773,7 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_dns_resolutions_total":               "counter",
 		"socksfilter_dns_cache_entries":                   "gauge",
 		"socksfilter_idle_timeout_closed_total":           "counter",
+		"socksfilter_entry_errors_total":                  "counter",
 		"socksfilter_max_connections":                     "gauge",
 		"socksfilter_upstream_up":                         "gauge",
 		"socksfilter_upstream_consecutive_failures":       "gauge",
@@ -3713,8 +3811,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 42 {
-		t.Fatalf("expected >=42 metric samples, got %d", samples)
+	if samples < 45 {
+		t.Fatalf("expected >=45 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -3939,6 +4037,31 @@ func TestPrometheusMetricsIdleCounters(t *testing.T) {
 		"# TYPE socksfilter_idle_timeout_closed_total counter",
 		`socksfilter_idle_timeout_closed_total{transport="tcp"} 8`,
 		`socksfilter_idle_timeout_closed_total{transport="udp"} 3`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+// TestPrometheusMetricsEntryErrors 验证入口错误 counter 按 reason 标签输出。
+func TestPrometheusMetricsEntryErrors(t *testing.T) {
+	saved := [3]int64{gEntryErrHandshake.Load(), gEntryErrBadRequest.Load(), gEntryErrUnsupportedCmd.Load()}
+	gEntryErrHandshake.Store(12)
+	gEntryErrBadRequest.Store(7)
+	gEntryErrUnsupportedCmd.Store(1)
+	t.Cleanup(func() {
+		gEntryErrHandshake.Store(saved[0])
+		gEntryErrBadRequest.Store(saved[1])
+		gEntryErrUnsupportedCmd.Store(saved[2])
+	})
+
+	text := renderPrometheusMetrics(time.Now())
+	for _, want := range []string{
+		"# TYPE socksfilter_entry_errors_total counter",
+		`socksfilter_entry_errors_total{reason="handshake"} 12`,
+		`socksfilter_entry_errors_total{reason="bad_request"} 7`,
+		`socksfilter_entry_errors_total{reason="unsupported_command"} 1`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("metrics output missing %q", want)
