@@ -1298,7 +1298,7 @@ func TestHealthCheckProbeCounters(t *testing.T) {
 	// 被动失败反馈只影响健康状态，不计入主动探测桶
 	beforeA, beforeF := h.probeAttempts.Load(), h.probeFails.Load()
 	beforeLast, beforeSum := h.probeLastNS.Load(), h.probeSumNS.Load()
-	reportUpstreamFailure(addr, "synthetic passive failure")
+	reportUpstreamFailure(addr, trafficFailStageHandshake, "synthetic passive failure")
 	if h.probeAttempts.Load() != beforeA || h.probeFails.Load() != beforeF {
 		t.Error("passive traffic failure must not move active probe counters")
 	}
@@ -1476,11 +1476,11 @@ func TestPassiveHealthFailureRecovery(t *testing.T) {
 	t.Cleanup(resetUpstreamHealth)
 
 	srv := "127.0.0.1:301"
-	reportUpstreamFailure(srv, "first error")
+	reportUpstreamFailure(srv, trafficFailStageDial, "first error")
 	if !isServerAlive(srv) {
 		t.Fatal("server should remain alive after first passive failure")
 	}
-	reportUpstreamFailure(srv, "second error")
+	reportUpstreamFailure(srv, trafficFailStageHandshake, "second error")
 	if isServerAlive(srv) {
 		t.Fatal("server should be marked dead after threshold")
 	}
@@ -1491,9 +1491,54 @@ func TestPassiveHealthFailureRecovery(t *testing.T) {
 		t.Fatal("server should recover on traffic success")
 	}
 	// 计数已清零：恢复后只再失败一次不应立即摘除
-	reportUpstreamFailure(srv, "one more error")
+	reportUpstreamFailure(srv, trafficFailStageWrite, "one more error")
 	if !isServerAlive(srv) {
 		t.Fatal("single failure after recovery should not mark dead (counter must reset)")
+	}
+
+	// 失败阶段分类计数不受健康翻转影响，累计保留
+	h := getUpstreamHealth(srv)
+	if h.trafficFailsDial.Load() != 1 || h.trafficFailsHandshake.Load() != 1 || h.trafficFailsWrite.Load() != 1 {
+		t.Errorf("traffic fail buckets dial=%d handshake=%d write=%d, want 1/1/1",
+			h.trafficFailsDial.Load(), h.trafficFailsHandshake.Load(), h.trafficFailsWrite.Load())
+	}
+}
+
+// TestReportUpstreamFailureStageBuckets 验证被动失败按阶段分桶：三类各自
+// 累计、互不串桶；主动探测路径不得移动这些桶；未知阶段不计入任何桶。
+func TestReportUpstreamFailureStageBuckets(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	srv := "127.0.0.1:302"
+	// 每次成功清零健康 fails，保证后续反馈不会因阈值摘除而影响分类计数
+	reportUpstreamFailure(srv, trafficFailStageDial, "d1")
+	reportUpstreamFailure(srv, trafficFailStageDial, "d2")
+	reportUpstreamFailure(srv, trafficFailStageHandshake, "h1")
+	reportUpstreamSuccess(srv)
+	reportUpstreamFailure(srv, trafficFailStageWrite, "w1")
+	reportUpstreamFailure(srv, "unknown-stage", "ignored")
+
+	h := getUpstreamHealth(srv)
+	if got := h.trafficFailCount(trafficFailStageDial); got != 2 {
+		t.Errorf("dial bucket=%d, want 2", got)
+	}
+	if got := h.trafficFailCount(trafficFailStageHandshake); got != 1 {
+		t.Errorf("handshake bucket=%d, want 1", got)
+	}
+	if got := h.trafficFailCount(trafficFailStageWrite); got != 1 {
+		t.Errorf("write bucket=%d, want 1", got)
+	}
+	if got := h.trafficFailCount("unknown-stage"); got != 0 {
+		t.Errorf("unknown stage bucket=%d, want 0", got)
+	}
+
+	// 主动探测失败不得计入被动流量桶
+	probeSrv := "127.0.0.1:1"
+	checkUpstream(probeSrv, time.Second)
+	ph := getUpstreamHealth(probeSrv)
+	if ph.trafficFailsDial.Load()+ph.trafficFailsHandshake.Load()+ph.trafficFailsWrite.Load() != 0 {
+		t.Error("active probe failure must not move passive traffic failure buckets")
 	}
 }
 
@@ -3604,6 +3649,9 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	getUpstreamHealth(srv0).probeSumNS.Store(6_000_000)  // avg 0.1ms over 60 probes
 	getUpstreamHealth(srv0).markedDead.Store(3)
 	getUpstreamHealth(srv0).recovered.Store(2)
+	getUpstreamHealth(srv0).trafficFailsDial.Store(9)
+	getUpstreamHealth(srv0).trafficFailsHandshake.Store(4)
+	getUpstreamHealth(srv0).trafficFailsWrite.Store(1)
 	directSessActive := gRouteSessionsActiveDirect.Load()
 	directSessTotal := gRouteSessionsTotalDirect.Load()
 	gRouteSessionsActiveDirect.Store(21)
@@ -3626,7 +3674,7 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		if line == "" {
 			t.Fatalf("missing upstream line for %s", srv)
 		}
-		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0", "probe_last_ms=0.000", "probe_avg_ms=0.000", "marked_dead=0", "recovered=0"}
+		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0", "probe_last_ms=0.000", "probe_avg_ms=0.000", "marked_dead=0", "recovered=0", "traffic_dial=0", "traffic_handshake=0", "traffic_write=0"}
 		if srv == srv0 {
 			wants[3] = "bytes_c2t=111"
 			wants[4] = "bytes_t2c=222"
@@ -3637,6 +3685,9 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 			wants[9] = "probe_avg_ms=0.100"
 			wants[10] = "marked_dead=3"
 			wants[11] = "recovered=2"
+			wants[12] = "traffic_dial=9"
+			wants[13] = "traffic_handshake=4"
+			wants[14] = "traffic_write=1"
 		}
 		for _, want := range wants {
 			if !strings.Contains(line, want) {
@@ -3918,6 +3969,7 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_upstream_health_probe_last_duration_seconds": "gauge",
 		"socksfilter_upstream_health_probe_duration_seconds":      "histogram",
 		"socksfilter_upstream_health_transitions_total":           "counter",
+		"socksfilter_upstream_traffic_failures_total":             "counter",
 	} {
 		if !strings.Contains(text, "# TYPE "+name+" "+typ) {
 			t.Errorf("missing TYPE declaration for %s %s", name, typ)
@@ -3949,8 +4001,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 102 {
-		t.Fatalf("expected >=102 metric samples, got %d", samples)
+	if samples < 111 {
+		t.Fatalf("expected >=111 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -4344,6 +4396,43 @@ func TestPrometheusMetricsHealthTransitions(t *testing.T) {
 		}
 		for _, event := range []string{"marked_dead", "recovered"} {
 			want := fmt.Sprintf(`socksfilter_upstream_health_transitions_total{upstream=%q,event=%q} 0`, srv, event)
+			if !strings.Contains(text, want) {
+				t.Errorf("metrics output missing zero sample %q", want)
+			}
+		}
+	}
+}
+
+// TestPrometheusMetricsTrafficFailures 验证被动流量失败分阶段 counter：
+// srv0 写入 dial=5/handshake=2/write=1 后输出对应样本，其余上游输出零值。
+func TestPrometheusMetricsTrafficFailures(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	srv0 := strings.Fields(*servers)[0]
+	getUpstreamHealth(srv0).trafficFailsDial.Store(5)
+	getUpstreamHealth(srv0).trafficFailsHandshake.Store(2)
+	getUpstreamHealth(srv0).trafficFailsWrite.Store(1)
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_traffic_failures_total counter") {
+		t.Fatal("missing TYPE declaration for socksfilter_upstream_traffic_failures_total")
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage="dial"} 5`, srv0),
+		fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage="handshake"} 2`, srv0),
+		fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage="write"} 1`, srv0),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+	for _, srv := range strings.Fields(*servers) {
+		if srv == srv0 {
+			continue
+		}
+		for _, stage := range []string{"dial", "handshake", "write"} {
+			want := fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage=%q} 0`, srv, stage)
 			if !strings.Contains(text, want) {
 				t.Errorf("metrics output missing zero sample %q", want)
 			}
