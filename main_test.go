@@ -2568,6 +2568,7 @@ func TestStatsHTTPEndpoint(t *testing.T) {
 		"udp_associations: active=",
 		"tcp_relay_bytes: client_to_target=",
 		"route_relay_bytes(tcp+udp payload): direct_c2t=",
+		"route_sessions(tcp+udp): direct_active=",
 		"upstreams:",
 	} {
 		if !strings.Contains(text, want) {
@@ -3225,8 +3226,166 @@ func TestRouteBytesUDPProxy(t *testing.T) {
 	}
 }
 
+// TestRouteSessionsTCPDirect 验证 TCP 直连隧道生命周期内 direct 出口
+// 活跃会话 +1、累计 +1，隧道关闭后活跃数回落，累计保留。
+func TestRouteSessionsTCPDirect(t *testing.T) {
+	init_env()
+	withIdleFlag(t, 0)
+
+	echoAddr, cleanupEcho := startEchoTCP(t)
+	defer cleanupEcho()
+	sfAddr, _, _, _ := serveTestEnv(t)
+
+	beforeActive := gRouteSessionsActiveDirect.Load()
+	beforeTotal := gRouteSessionsTotalDirect.Load()
+
+	client := socksConnectTo(t, sfAddr, echoAddr)
+	payload := []byte("route-session-direct")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("write payload fail: %v", err)
+	}
+	echoBuf := make([]byte, len(payload))
+	if _, err := io.ReadFull(client, echoBuf); err != nil {
+		t.Fatalf("read echo fail: %v", err)
+	}
+
+	waitFor(t, "direct tcp session active", 3*time.Second, func() bool {
+		return gRouteSessionsActiveDirect.Load() == beforeActive+1 &&
+			gRouteSessionsTotalDirect.Load() == beforeTotal+1
+	})
+
+	_ = client.Close()
+	waitFor(t, "direct tcp session reaped", 3*time.Second, func() bool {
+		return gRouteSessionsActiveDirect.Load() == beforeActive
+	})
+	if gRouteSessionsTotalDirect.Load() != beforeTotal+1 {
+		t.Errorf("direct total sessions=%d, want %d", gRouteSessionsTotalDirect.Load(), beforeTotal+1)
+	}
+}
+
+// TestRouteSessionsTCPProxy 验证经上游建立的 TCP 隧道计入该上游活跃/累计，
+// direct 桶不变；关闭后上游活跃数回落。
+func TestRouteSessionsTCPProxy(t *testing.T) {
+	init_env()
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	echoAddr, cleanupEcho := startEchoTCP(t)
+	t.Cleanup(cleanupEcho)
+	upstreamAddr, cleanupUp := startAuthConnectUpstream(t, "", "", echoAddr)
+	t.Cleanup(cleanupUp)
+
+	withGlobalFlags(t, upstreamAddr, "", "")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	t.Cleanup(cleanupSF)
+
+	directBeforeActive := gRouteSessionsActiveDirect.Load()
+	directBeforeTotal := gRouteSessionsTotalDirect.Load()
+
+	payload := []byte("route-session-up!!")
+	client := proxyRequestOnce(t, sfAddr)
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("write fail: %v", err)
+	}
+	echoBuf := make([]byte, len(payload))
+	if _, err := io.ReadFull(client, echoBuf); err != nil {
+		t.Fatalf("read echo fail: %v", err)
+	}
+
+	h := getUpstreamHealth(upstreamAddr)
+	waitFor(t, "upstream tcp session active", 3*time.Second, func() bool {
+		return h.sessionsActive.Load() == 1 && h.established.Load() == 1
+	})
+
+	_ = client.Close()
+	waitFor(t, "upstream tcp session reaped", 3*time.Second, func() bool {
+		return h.sessionsActive.Load() == 0
+	})
+	if gRouteSessionsActiveDirect.Load() != directBeforeActive || gRouteSessionsTotalDirect.Load() != directBeforeTotal {
+		t.Errorf("direct session counters must stay unchanged via upstream route: active %d->%d total %d->%d",
+			directBeforeActive, gRouteSessionsActiveDirect.Load(), directBeforeTotal, gRouteSessionsTotalDirect.Load())
+	}
+}
+
+// TestRouteSessionsUDPDirect 验证 UDP 直连套接字建立后 direct 出口会话计数，
+// 关联关闭（控制 TCP 断开）后活跃数回落。
+func TestRouteSessionsUDPDirect(t *testing.T) {
+	init_env()
+	withUDPIdleFlag(t, 0)
+
+	echoConn, cleanupEcho := startUDPEcho(t)
+	defer cleanupEcho()
+	sfAddr, _, _, _ := serveTestEnv(t)
+
+	beforeActive := gRouteSessionsActiveDirect.Load()
+	beforeTotal := gRouteSessionsTotalDirect.Load()
+
+	clientTCP, clientUDP, relayAddr := udpAssocEnv(t, sfAddr)
+	udpRoundtrip(t, clientUDP, relayAddr, echoConn.LocalAddr().(*net.UDPAddr))
+
+	waitFor(t, "direct udp session active", 3*time.Second, func() bool {
+		return gRouteSessionsActiveDirect.Load() == beforeActive+1 &&
+			gRouteSessionsTotalDirect.Load() == beforeTotal+1
+	})
+
+	_ = clientTCP.Close()
+	waitFor(t, "direct udp session reaped", 3*time.Second, func() bool {
+		return gRouteSessionsActiveDirect.Load() == beforeActive
+	})
+	if gRouteSessionsTotalDirect.Load() != beforeTotal+1 {
+		t.Errorf("direct total sessions=%d, want %d", gRouteSessionsTotalDirect.Load(), beforeTotal+1)
+	}
+}
+
+// TestRouteSessionsUDPProxy 验证 UDP 上游会话计入该上游活跃/累计，direct 桶不变；
+// 关联关闭时 closeOnce 路径保证活跃数恰好减一次。
+func TestRouteSessionsUDPProxy(t *testing.T) {
+	init_env()
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	upstreamAddr, _, cleanupUp := startMockUDPRelay(t, "r:", "", "")
+	t.Cleanup(cleanupUp)
+
+	withGlobalFlags(t, upstreamAddr, "", "")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+	t.Cleanup(cleanupSF)
+
+	directBeforeActive := gRouteSessionsActiveDirect.Load()
+	directBeforeTotal := gRouteSessionsTotalDirect.Load()
+
+	clientTCP, clientUDP, relayAddr := udpAssocEnv(t, sfAddr)
+
+	pkt, err := network.Sock5PackUDP("8.8.8.8", 53, []byte("ab"))
+	if err != nil {
+		t.Fatalf("PackUDP fail: %v", err)
+	}
+	if _, err := clientUDP.WriteToUDP(pkt, relayAddr); err != nil {
+		t.Fatalf("WriteToUDP fail: %v", err)
+	}
+	_ = clientUDP.SetReadDeadline(time.Now().Add(3 * time.Second))
+	respBuf := make([]byte, 2048)
+	if _, _, err := clientUDP.ReadFromUDP(respBuf); err != nil {
+		t.Fatalf("read upstream reply fail: %v", err)
+	}
+
+	h := getUpstreamHealth(upstreamAddr)
+	waitFor(t, "upstream udp session active", 3*time.Second, func() bool {
+		return h.sessionsActive.Load() == 1 && h.established.Load() == 1
+	})
+
+	_ = clientTCP.Close()
+	waitFor(t, "upstream udp session reaped", 3*time.Second, func() bool {
+		return h.sessionsActive.Load() == 0
+	})
+	if gRouteSessionsActiveDirect.Load() != directBeforeActive || gRouteSessionsTotalDirect.Load() != directBeforeTotal {
+		t.Errorf("direct session counters must stay unchanged via upstream route: active %d->%d total %d->%d",
+			directBeforeActive, gRouteSessionsActiveDirect.Load(), directBeforeTotal, gRouteSessionsTotalDirect.Load())
+	}
+}
+
 // TestStatsRendersUpstreamCounters 验证 /stats 文本包含每上游的累计字段，
-// 包括 v0.7.6 的按出口归因字节，以及 direct 汇总行。
+// 包括 v0.7.6 的按出口归因字节、v0.7.7 的按出口归因会话，以及 direct 汇总行。
 func TestStatsRendersUpstreamCounters(t *testing.T) {
 	resetUpstreamHealth()
 	t.Cleanup(resetUpstreamHealth)
@@ -3243,6 +3402,15 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	})
 	getUpstreamHealth(srv0).bytesC2T.Store(111)
 	getUpstreamHealth(srv0).bytesT2C.Store(222)
+	getUpstreamHealth(srv0).sessionsActive.Store(7)
+	directSessActive := gRouteSessionsActiveDirect.Load()
+	directSessTotal := gRouteSessionsTotalDirect.Load()
+	gRouteSessionsActiveDirect.Store(21)
+	gRouteSessionsTotalDirect.Store(42)
+	t.Cleanup(func() {
+		gRouteSessionsActiveDirect.Store(directSessActive)
+		gRouteSessionsTotalDirect.Store(directSessTotal)
+	})
 
 	text := renderStats(time.Now())
 	for _, srv := range strings.Fields(*servers) {
@@ -3257,10 +3425,11 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		if line == "" {
 			t.Fatalf("missing upstream line for %s", srv)
 		}
-		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0"}
+		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0"}
 		if srv == srv0 {
 			wants[3] = "bytes_c2t=111"
 			wants[4] = "bytes_t2c=222"
+			wants[5] = "sessions_active=7"
 		}
 		for _, want := range wants {
 			if !strings.Contains(line, want) {
@@ -3270,6 +3439,9 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	}
 	if !strings.Contains(text, "direct_c2t=4321 direct_t2c=8765") {
 		t.Errorf("stats text missing direct route totals:\n%s", text)
+	}
+	if !strings.Contains(text, "route_sessions(tcp+udp): direct_active=21 direct_total=42") {
+		t.Errorf("stats text missing direct route sessions:\n%s", text)
 	}
 }
 
@@ -3323,6 +3495,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_udp_associations_total":              "counter",
 		"socksfilter_tcp_relay_bytes_total":               "counter",
 		"socksfilter_relay_bytes_total":                   "counter",
+		"socksfilter_route_sessions_active":               "gauge",
+		"socksfilter_route_sessions_total":                "counter",
 		"socksfilter_max_connections":                     "gauge",
 		"socksfilter_upstream_up":                         "gauge",
 		"socksfilter_upstream_consecutive_failures":       "gauge",
@@ -3360,8 +3534,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 25 {
-		t.Fatalf("expected >=25 metric samples, got %d", samples)
+	if samples < 33 {
+		t.Fatalf("expected >=33 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -3463,6 +3637,63 @@ func TestPrometheusMetricsRouteBytes(t *testing.T) {
 		}
 		for _, dir := range []string{"client_to_target", "target_to_client"} {
 			want := fmt.Sprintf(`socksfilter_relay_bytes_total{route=%q,direction=%q} 0`, srv, dir)
+			if !strings.Contains(text, want) {
+				t.Errorf("metrics output missing zero sample %q", want)
+			}
+		}
+	}
+}
+
+// TestPrometheusMetricsRouteSessions 验证 per-route 会话指标：direct 活跃/累计
+// 恒输出；每上游输出活跃 gauge 与累计（取 established）；其余上游为零值样本。
+func TestPrometheusMetricsRouteSessions(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	srv0 := strings.Fields(*servers)[0]
+	directActive := gRouteSessionsActiveDirect.Load()
+	directTotal := gRouteSessionsTotalDirect.Load()
+	gRouteSessionsActiveDirect.Store(21)
+	gRouteSessionsTotalDirect.Store(42)
+	t.Cleanup(func() {
+		gRouteSessionsActiveDirect.Store(directActive)
+		gRouteSessionsTotalDirect.Store(directTotal)
+	})
+	h0 := getUpstreamHealth(srv0)
+	h0.sessionsActive.Store(7)
+	h0.established.Store(9)
+	t.Cleanup(func() {
+		h0.sessionsActive.Store(0)
+		h0.established.Store(0)
+	})
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_route_sessions_active gauge") {
+		t.Error("missing TYPE declaration for socksfilter_route_sessions_active")
+	}
+	if !strings.Contains(text, "# TYPE socksfilter_route_sessions_total counter") {
+		t.Error("missing TYPE declaration for socksfilter_route_sessions_total")
+	}
+	for _, want := range []string{
+		`socksfilter_route_sessions_active{route="direct"} 21`,
+		`socksfilter_route_sessions_total{route="direct"} 42`,
+		fmt.Sprintf(`socksfilter_route_sessions_active{route=%q} 7`, srv0),
+		fmt.Sprintf(`socksfilter_route_sessions_total{route=%q} 9`, srv0),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+
+	// 其余未承载流量的上游也必须输出零值样本
+	for _, srv := range strings.Fields(*servers) {
+		if srv == srv0 {
+			continue
+		}
+		for _, want := range []string{
+			fmt.Sprintf(`socksfilter_route_sessions_active{route=%q} 0`, srv),
+			fmt.Sprintf(`socksfilter_route_sessions_total{route=%q} 0`, srv),
+		} {
 			if !strings.Contains(text, want) {
 				t.Errorf("metrics output missing zero sample %q", want)
 			}

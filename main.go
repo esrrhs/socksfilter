@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.6"
+	version = "0.7.7"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -85,6 +85,12 @@ var (
 	// upstreamHealth 的 bytesC2T/bytesT2C。c2t = client -> target。
 	gRouteBytesDirectC2T atomic.Int64
 	gRouteBytesDirectT2C atomic.Int64
+
+	// 按出口归因的会话计数（TCP CONNECT 隧道与 UDP 会话统一口径）：
+	// direct 桶保留累计建立数与当前活跃数；经上游的活跃会话记入对应
+	// upstreamHealth.sessionsActive，累计建立数复用 established。
+	gRouteSessionsTotalDirect  atomic.Int64
+	gRouteSessionsActiveDirect atomic.Int64
 )
 
 // loadFlagsFromConfig 从 JSON 配置文件填充未在命令行显式指定的 flag。
@@ -353,6 +359,8 @@ func renderStats(now time.Time) string {
 		gBytesClientToTarget.Load(), gBytesTargetToClient.Load())
 	fmt.Fprintf(&b, "route_relay_bytes(tcp+udp payload): direct_c2t=%d direct_t2c=%d\n",
 		gRouteBytesDirectC2T.Load(), gRouteBytesDirectT2C.Load())
+	fmt.Fprintf(&b, "route_sessions(tcp+udp): direct_active=%d direct_total=%d\n",
+		gRouteSessionsActiveDirect.Load(), gRouteSessionsTotalDirect.Load())
 
 	b.WriteString("upstreams:\n")
 	for _, server := range strings.Fields(*servers) {
@@ -365,9 +373,9 @@ func renderStats(now time.Time) string {
 				state = "dead"
 			}
 		}
-		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d",
+		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d",
 			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
-			h.bytesC2T.Load(), h.bytesT2C.Load())
+			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load())
 		if state == "dead" || state == "half_open" {
 			if deadAt := h.deadAt.Load(); deadAt > 0 {
 				fmt.Fprintf(&b, " removed_since=%s", now.Sub(time.Unix(0, deadAt)).Round(time.Second))
@@ -443,6 +451,16 @@ func renderPrometheusMetrics(now time.Time) string {
 	fmt.Fprintf(&b, "socksfilter_relay_bytes_total{route=\"%s\",direction=\"%s\"} %d\n",
 		"direct", "target_to_client", gRouteBytesDirectT2C.Load())
 
+	// 按出口归因的会话：活跃 gauge 与累计建立 counter（TCP CONNECT 隧道 +
+	// UDP 会话）。route="direct" 为分流直连；上游路由的 total 与
+	// socksfilter_upstream_sessions_established_total 同值，仅标签口径统一为 route。
+	b.WriteString("# HELP socksfilter_route_sessions_active Currently active sessions egressing through this route (established TCP CONNECT tunnels and UDP sessions).\n# TYPE socksfilter_route_sessions_active gauge\n")
+	fmt.Fprintf(&b, "socksfilter_route_sessions_active{route=\"%s\"} %d\n",
+		"direct", gRouteSessionsActiveDirect.Load())
+	b.WriteString("# HELP socksfilter_route_sessions_total Total sessions established via this egress route (TCP CONNECT tunnels and UDP sessions).\n# TYPE socksfilter_route_sessions_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_route_sessions_total{route=\"%s\"} %d\n",
+		"direct", gRouteSessionsTotalDirect.Load())
+
 	b.WriteString("# HELP socksfilter_max_connections Configured concurrent session limit; 0 means unlimited.\n# TYPE socksfilter_max_connections gauge\n")
 	fmt.Fprintf(&b, "socksfilter_max_connections %d\n", *maxConn)
 
@@ -468,6 +486,10 @@ func renderPrometheusMetrics(now time.Time) string {
 			routeLabel, "client_to_target", h.bytesC2T.Load())
 		fmt.Fprintf(&b, "socksfilter_relay_bytes_total%s,direction=\"%s\"} %d\n",
 			routeLabel, "target_to_client", h.bytesT2C.Load())
+		fmt.Fprintf(&b, "socksfilter_route_sessions_active{route=\"%s\"} %d\n",
+			promLabelValue(server), h.sessionsActive.Load())
+		fmt.Fprintf(&b, "socksfilter_route_sessions_total{route=\"%s\"} %d\n",
+			promLabelValue(server), h.established.Load())
 	}
 	return b.String()
 }
@@ -779,6 +801,10 @@ type upstreamHealth struct {
 	// bytesC2T 为客户端 -> 目标，bytesT2C 为目标 -> 客户端。
 	bytesC2T atomic.Int64
 	bytesT2C atomic.Int64
+
+	// sessionsActive 为当前经该出口传输中的会话数（TCP CONNECT 隧道 +
+	// UDP 上游会话），建立成功时 +1、会话关闭时 -1（closeOnce 保证恰好一次）。
+	sessionsActive atomic.Int64
 }
 
 var gUpstreamHealth sync.Map // server -> *upstreamHealth
@@ -1128,6 +1154,9 @@ type udpUpstreamSession struct {
 
 func (s *udpUpstreamSession) close() {
 	s.closeOnce.Do(func() {
+		// 与 getOrCreateUpstreamSession 建立成功时的 +1 配对，
+		// closeOnce 保证 removeUpstreamSession 与 assoc.close 两条路径只减一次。
+		getUpstreamHealth(s.server).sessionsActive.Add(-1)
 		if s.proxyTCPConn != nil {
 			_ = s.proxyTCPConn.Close()
 		}
@@ -1180,6 +1209,7 @@ func (assoc *udpAssociation) close() {
 		assoc.directMu.Lock()
 		if assoc.directConn != nil {
 			_ = assoc.directConn.Close()
+			gRouteSessionsActiveDirect.Add(-1)
 		}
 		assoc.directMu.Unlock()
 
@@ -1299,6 +1329,9 @@ func (assoc *udpAssociation) getOrCreateDirectConn() (*net.UDPConn, error) {
 		return nil, err
 	}
 	assoc.directConn = dConn
+	// UDP 直连套接字建立成功即计入 direct 出口会话；assoc.close 关闭它时配对 -1。
+	gRouteSessionsTotalDirect.Add(1)
+	gRouteSessionsActiveDirect.Add(1)
 
 	go func() {
 		buf := make([]byte, 65535)
@@ -1528,6 +1561,7 @@ func (assoc *udpAssociation) getOrCreateUpstreamSession(server string) (*udpUpst
 	assoc.upstreamSessions[server] = session
 	// 会话建立成功瞬间入账；后续包复用该会话不再计数。
 	h.established.Add(1)
+	h.sessionsActive.Add(1) // 与 session.close() 的 -1 配对
 	created = true
 	loggo.Info("udp established upstream session to %s (relay %s) for client %s", server, relayUDPAddr, assoc.clientTCPRemoteAddr)
 	return session, nil
@@ -1719,6 +1753,9 @@ func process_proxy_server(ctx context.Context, conn *net.TCPConn, targetAddr str
 	// 会话已建立：成功瞬间入账，随后 relay 即使中断也不改写该口径。
 	h.established.Add(1)
 	established = true
+	// 经该上游的活跃 TCP 隧道 +1，relay 返回、本函数退出时配对 -1。
+	h.sessionsActive.Add(1)
+	defer h.sessionsActive.Add(-1)
 
 	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
@@ -1755,6 +1792,11 @@ func process_direct(ctx context.Context, conn *net.TCPConn, targetAddr string) {
 	tcpsrcaddr := conn.RemoteAddr().(*net.TCPAddr)
 
 	loggo.Info("process_direct client accept new direct local tcp %s %s", tcpsrcaddr.String(), targetAddr)
+
+	// 直连拨号成功即视为 direct 出口会话建立；relay 返回时活跃数 -1。
+	gRouteSessionsTotalDirect.Add(1)
+	gRouteSessionsActiveDirect.Add(1)
+	defer gRouteSessionsActiveDirect.Add(-1)
 
 	relay(ctx, conn, targetconn, &gRouteBytesDirectC2T, &gRouteBytesDirectT2C)
 }
