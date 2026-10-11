@@ -3162,6 +3162,98 @@ func TestReadyzEndpoint(t *testing.T) {
 	}
 }
 
+// TestReadyzUpstreamDetails 验证就绪探针响应体的上游明细：全部摘除时逐上游
+// 列 state=dead；冷却期满进入半开后探针重新就绪，汇总 half_open 计数正确，
+// 明细行出现 state=half_open 与 removed_since；HEAD 只返回状态码无响应体。
+func TestReadyzUpstreamDetails(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+	oldCooldown := gHealthCooldown.Load()
+	gHealthCooldown.Store(int64(time.Hour))
+	t.Cleanup(func() { gHealthCooldown.Store(oldCooldown) })
+
+	addr, stop, err := startStatsServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("start observability server fail: %v", err)
+	}
+	defer stop()
+
+	configured := strings.Fields(*servers)
+	now := time.Now()
+	for _, srv := range configured {
+		h := getUpstreamHealth(srv)
+		for i := 0; i < healthFailThreshold; i++ {
+			h.recordFailure(now)
+		}
+	}
+
+	resp, err := http.Get("http://" + addr + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz fail: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+	text := string(body)
+	if want := fmt.Sprintf("all %d upstreams are dead (alive=0 half_open=0 total=%d)", len(configured), len(configured)); !strings.Contains(text, want) {
+		t.Fatalf("summary line missing %q: %q", want, text)
+	}
+	// 每个上游都应列出明细行
+	for _, srv := range configured {
+		if !strings.Contains(text, "  "+srv+": state=dead removed_since=") {
+			t.Errorf("missing dead detail line for %s: %q", srv, text)
+		}
+	}
+
+	// 冷却期满：摘除最久的第一个上游进入半开（deadAt 最早）
+	gHealthCooldown.Store(0)
+	resp2, err := http.Get("http://" + addr + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz fail: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("half-open upstream must make readiness 200, got %d", resp2.StatusCode)
+	}
+	text2 := string(body2)
+	// cooldown=0 后全部摘除上游均进入半开
+	if want := fmt.Sprintf("alive=0 dead=0 half_open=%d total=%d", len(configured), len(configured)); !strings.Contains(text2, want) {
+		t.Fatalf("half-open summary missing %q: %q", want, text2)
+	}
+	for _, srv := range configured {
+		if !strings.Contains(text2, "  "+srv+": state=half_open removed_since=") {
+			t.Errorf("missing half_open detail line for %s: %q", srv, text2)
+		}
+	}
+
+	// HEAD：状态码随就绪状态返回，但无响应体
+	headResp, err := http.Head("http://" + addr + "/readyz")
+	if err != nil {
+		t.Fatalf("HEAD /readyz fail: %v", err)
+	}
+	headBody, _ := io.ReadAll(headResp.Body)
+	_ = headResp.Body.Close()
+	if headResp.StatusCode != http.StatusOK {
+		t.Errorf("HEAD expected 200, got %d", headResp.StatusCode)
+	}
+	if len(headBody) != 0 {
+		t.Errorf("HEAD body must be empty, got %q", headBody)
+	}
+
+	// POST 拒绝
+	postResp, err := http.Post("http://"+addr+"/readyz", "text/plain", nil)
+	if err != nil {
+		t.Fatalf("POST /readyz fail: %v", err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST expected 405, got %d", postResp.StatusCode)
+	}
+}
+
 // TestReadyzNoUpstreamsConfigured 验证未配置任何上游时就绪探针返回 503。
 func TestReadyzNoUpstreamsConfigured(t *testing.T) {
 	oldServers := *servers

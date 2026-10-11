@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.15"
+	version = "0.7.16"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -395,14 +395,7 @@ func renderStats(now time.Time) string {
 	b.WriteString("upstreams:\n")
 	for _, server := range strings.Fields(*servers) {
 		h := getUpstreamHealth(server)
-		state := "alive"
-		if !h.alive.Load() {
-			if h.isAlive(now) {
-				state = "half_open"
-			} else {
-				state = "dead"
-			}
-		}
+		state := h.state(now)
 		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f marked_dead=%d recovered=%d traffic_dial=%d traffic_handshake=%d traffic_request=%d traffic_write=%d",
 			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
 			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load(),
@@ -628,6 +621,52 @@ func readinessSummary(now time.Time) (alive, dead int) {
 	return alive, dead
 }
 
+// renderReadyz 生成就绪探针响应：ready 为 true 表示至少一个上游可参与选路
+// （alive 或冷却期满的 half_open）。响应体首行给出 alive/dead/half_open/total
+// 汇总，随后逐上游列出三态与摘除时长，便于编排层在 503 时直接定位故障节点。
+func renderReadyz(now time.Time) (ready bool, body string) {
+	list := strings.Fields(*servers)
+	if len(list) == 0 {
+		return false, "not ready: no upstreams configured\n"
+	}
+
+	var aliveN, halfOpenN, deadN int
+	lines := make([]string, 0, len(list))
+	for _, server := range list {
+		h := getUpstreamHealth(server)
+		st := h.state(now)
+		switch st {
+		case "alive":
+			aliveN++
+		case "half_open":
+			halfOpenN++
+		default:
+			deadN++
+		}
+		line := "  " + server + ": state=" + st
+		if st != "alive" {
+			if deadAt := h.deadAt.Load(); deadAt > 0 {
+				line += " removed_since=" + now.Sub(time.Unix(0, deadAt)).Round(time.Second).String()
+			}
+		}
+		lines = append(lines, line)
+	}
+
+	var b strings.Builder
+	if aliveN+halfOpenN > 0 {
+		fmt.Fprintf(&b, "ready: upstreams alive=%d dead=%d half_open=%d total=%d\n",
+			aliveN, deadN, halfOpenN, len(list))
+	} else {
+		fmt.Fprintf(&b, "not ready: all %d upstreams are dead (alive=0 half_open=0 total=%d)\n",
+			deadN, len(list))
+	}
+	for _, line := range lines {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return aliveN+halfOpenN > 0, b.String()
+}
+
 // handleReadyz 就绪探针：至少一个上游可参与选路时返回 200；全部处于摘除
 // 状态（或未配置上游）时返回 503，供 readinessProbe 在故障窗口摘除流量。
 // 注意数据面仍是 fail-open 语义：即使全部上游故障，sf 也会按需尝试拨号，
@@ -636,24 +675,16 @@ func handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if !allowProbeMethod(w, r) {
 		return
 	}
-	alive, dead := readinessSummary(time.Now())
-	if alive > 0 {
+	ready, body := renderReadyz(time.Now())
+	if ready {
 		w.WriteHeader(http.StatusOK)
-		if r.Method == http.MethodHead {
-			return
-		}
-		_, _ = fmt.Fprintf(w, "ready: upstreams alive=%d dead=%d\n", alive, dead)
-		return
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-	w.WriteHeader(http.StatusServiceUnavailable)
 	if r.Method == http.MethodHead {
 		return
 	}
-	if dead == 0 {
-		_, _ = w.Write([]byte("not ready: no upstreams configured\n"))
-	} else {
-		_, _ = fmt.Fprintf(w, "not ready: all %d upstreams are dead\n", dead)
-	}
+	_, _ = w.Write([]byte(body))
 }
 
 func init_env() {
@@ -995,6 +1026,18 @@ func (h *upstreamHealth) isAlive(now time.Time) bool {
 
 func isServerAlive(server string) bool {
 	return getUpstreamHealth(server).isAlive(time.Now())
+}
+
+// state 返回三态健康状态：alive（存活）、half_open（已摘除但冷却期满，
+// 可参与试探选路）、dead（摘除且仍在冷却窗口内）。
+func (h *upstreamHealth) state(now time.Time) string {
+	if h.alive.Load() {
+		return "alive"
+	}
+	if h.isAlive(now) {
+		return "half_open"
+	}
+	return "dead"
 }
 
 // recordFailure 记录一次失败（主动探测或真实流量反馈）。达到阈值即摘除；
