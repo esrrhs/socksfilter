@@ -18,6 +18,8 @@ A lightweight SOCKS5 traffic routing and aggregation proxy filter.
   * **Private & LAN IP Direct**: Automatically identifies and bypasses private IP ranges (e.g. `127.0.0.1`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
   * **GeoIP Country Filtering**: Filters based on destination IP country code (default `CN`). Matches connect directly; non-matches are routed to upstream SOCKS5 servers.
   * **High-Performance DNS Cache**: Built-in multi-core concurrent LRU cache and singleflight deduplication to reduce redundant DNS lookups.
+* **Upstream SOCKS5 Authentication**: Forwards username/password credentials (RFC 1929) to upstream SOCKS5 servers for both TCP CONNECT and UDP ASSOCIATE.
+* **Upstream Health Checks (Active + Passive)**: Actively probes each upstream periodically (TCP connect + SOCKS5 handshake, using `-susername`/`-spassword`), and also learns from real traffic — TCP/UDP dial, handshake, or UDP relay-write failures feed the same health state while successes clear it. An upstream failing two consecutive checks is removed from candidate selection. After a cooldown it enters half-open state and retries with a single request, recovering on success or re-entering cooldown on failure (cooldown equals the probe interval, or 10s when active probing is disabled). If every upstream is down, selection fails open to on-demand failover.
 * **Upstream Multi-Server Load Balancing**: Aggregates multiple backend SOCKS5 servers with flexible load balancing strategies:
   * `robin`: Thread-safe Round-Robin rotation.
   * `rand`: Random selection.
@@ -26,6 +28,11 @@ A lightweight SOCKS5 traffic routing and aggregation proxy filter.
   * `hash_all`: Combined source and destination hash.
   * Automatically skips unreachable backend servers.
 * **Graceful Shutdown & Leak Prevention**: Handles `SIGINT` / `SIGTERM` signals for clean listener termination, and features TCP half-close propagation and connection leak prevention.
+* **Concurrent Session Limit**: With `-max-conn`, caps concurrent SOCKS sessions (TCP CONNECT and UDP ASSOCIATE share one pool). Overflow sessions receive a proper SOCKS5 failure reply instead of being silently reset, and the rejected count is exposed in stats. Disabled (`0`) by default.
+* **Runtime Observability Endpoint**: With `-stats-addr` (e.g. `127.0.0.1:7070`), serves plain-text HTTP endpoints (disabled by default):
+  * `GET /stats`: uptime, active/total/rejected TCP connections, active/total UDP associations, cumulative relayed bytes per direction, and per-upstream health state (`alive` / `half_open` / `dead` with failure count and removal duration) plus cumulative per-upstream session counters `attempts` / `established` / `connect_fails` (TCP CONNECT and UDP ASSOCIATE combined; UDP session reuse is not counted again).
+  * `GET /healthz`: liveness probe, always `200 ok` while the process can serve HTTP.
+  * `GET /readyz`: readiness probe for container orchestrators — `200` when at least one upstream is selectable, `503` when all upstreams are removed (the data plane itself stays fail-open and keeps trying on demand).
 
 ## Usage
 
@@ -93,12 +100,22 @@ Usage of ./socksfilter:
     	cache size for dns (default 1000)
   -china_domains string
     	china domains file (default "accelerated-domains.china.conf")
+  -dial-timeout int
+    	tcp dial timeout in seconds for upstream and direct targets (default 10)
   -file string
     	ip file (default "GeoLite2-Country.mmdb")
+  -health-check-interval int
+    	upstream health check interval in seconds, 0 to disable (default 30)
+  -health-check-timeout int
+    	upstream health check timeout in seconds (default 5)
+  -idle-timeout int
+    	idle timeout in seconds for relayed tcp connections, 0 to disable
   -l string
     	listen addr (default ":1080")
   -loglevel string
     	log level (default "info")
+  -max-conn int
+    	max concurrent socks sessions (tcp connect and udp associate), 0 to disable
   -nolog int
     	write log file
   -noprint int
@@ -109,8 +126,20 @@ Usage of ./socksfilter:
     	server addr (default "server1 server2 server3")
   -select string
     	select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all (default "robin")
+  -shutdown-timeout int
+    	grace period in seconds to wait for in-flight connections on shutdown, 0 to force close immediately (default 10)
   -skip string
     	skip country (default "CN")
+  -spassword string
+    	upstream server password
+  -stats-addr string
+    	http listen addr for runtime stats, e.g. 127.0.0.1:7070, empty to disable
+  -susername string
+    	upstream server username
+  -tcp-keepalive int
+    	tcp keepalive idle time in seconds for client and upstream connections, 0 to disable (default 30)
+  -udp-idle-timeout int
+    	idle timeout in seconds for udp associations, 0 to disable (default 300)
   -username string
     	username
   -version
