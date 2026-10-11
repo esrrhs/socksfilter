@@ -2371,9 +2371,25 @@ func TestEnableTCPKeepAliveEcho(t *testing.T) {
 	}
 }
 
+// readKeepaliveSwitch 返回 SO_KEEPALIVE 开关位；各内核启用值不同（linux=1，
+// darwin=8），故调用方只按「0=关 / 非0=开」判定。
+func readKeepaliveSwitch(t *testing.T, c *net.TCPConn) int {
+	t.Helper()
+	rc, err := c.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn fail: %v", err)
+	}
+	var enabled int
+	if err := rc.Control(func(fd uintptr) {
+		enabled, _ = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE)
+	}); err != nil {
+		t.Fatalf("Control fail: %v", err)
+	}
+	return enabled
+}
+
 func TestTCPKeepaliveDisabledLeavesSocket(t *testing.T) {
-	idleOpt, supported := tcpKeepaliveIdleOpt()
-	if !supported {
+	if _, supported := tcpKeepaliveIdleOpt(); !supported {
 		t.Skipf("keepalive sockopt check unsupported on %s", runtime.GOOS)
 	}
 	withTCPKeepaliveFlag(t, 0)
@@ -2383,57 +2399,30 @@ func TestTCPKeepaliveDisabledLeavesSocket(t *testing.T) {
 		t.Fatalf("listen fail: %v", err)
 	}
 	defer ln.Close()
-	acceptDone := make(chan struct{})
+	acceptSide := make(chan int, 1)
 	go func() {
 		c, _ := ln.AcceptTCP()
 		if c != nil {
-			enableTCPKeepAlive(c) // flag=0，helper 应立即返回不动 socket
-			_ = c.Close()
-		}
-		close(acceptDone)
-	}()
-
-	// 先取一条系统默认连接的内核 idle 值作为对照（darwin 通常 15s，linux 7200s）
-	probeLn, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatalf("probe listen fail: %v", err)
-	}
-	defer probeLn.Close()
-	go func() {
-		c, _ := probeLn.AcceptTCP()
-		if c != nil {
+			// flag=0：两条路径都必须显式关闭。Go 零值 Dialer 会在拨出侧默认
+			// 开启 keepalive；darwin 上 accept 侧系统默认也是开启的。
+			enableTCPKeepAlive(c)
+			acceptSide <- readKeepaliveSwitch(t, c)
 			_ = c.Close()
 		}
 	}()
-	probe, err := net.DialTCP("tcp", nil, probeLn.Addr().(*net.TCPAddr))
-	if err != nil {
-		t.Fatalf("probe dial fail: %v", err)
-	}
-	defaultIdle := getTCPSockoptInt(t, probe, idleOpt)
-	_ = probe.Close()
 
-	// dialTCPTimeout 内部也会调用 enableTCPKeepAlive；flag=0 时内核 idle 值必须保持系统默认
+	// dialTCPTimeout 内部也会调用 enableTCPKeepAlive
 	c, err := dialTCPTimeout(ln.Addr().String(), 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial fail: %v", err)
 	}
 	defer c.Close()
-	<-acceptDone // 等 accept goroutine 读完 flag 后再允许 cleanup 恢复，避免数据竞争
-	if got := getTCPSockoptInt(t, c, idleOpt); got != defaultIdle {
-		t.Errorf("expected keepalive idle unchanged (%d) when disabled, got %d", defaultIdle, got)
+	if got := <-acceptSide; got != 0 {
+		t.Errorf("accepted conn: expected SO_KEEPALIVE=0 when disabled, got %d", got)
 	}
-	if runtime.GOOS == "linux" {
-		rc, err := c.SyscallConn()
-		if err != nil {
-			t.Fatalf("SyscallConn fail: %v", err)
-		}
-		var enabled int
-		_ = rc.Control(func(fd uintptr) {
-			enabled, _ = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE)
-		})
-		if enabled != 0 {
-			t.Errorf("expected SO_KEEPALIVE=0 when disabled, got %d", enabled)
-		}
+	// 等 accept goroutine 读完 flag 后再允许 cleanup 恢复，避免数据竞争
+	if got := readKeepaliveSwitch(t, c); got != 0 {
+		t.Errorf("dialed conn: expected SO_KEEPALIVE=0 when disabled, got %d", got)
 	}
 }
 

@@ -830,8 +830,16 @@ func admitSession() bool {
 // 不主动关闭空闲但健康的长连接，是传输层兜底。
 // 任何平台相关的设置失败都不得中断连接处理，逐级回退到最基础的保活开关。
 func enableTCPKeepAlive(conn *net.TCPConn) {
+	if conn == nil {
+		return
+	}
 	idle := tcpKeepaliveIdle()
-	if idle <= 0 || conn == nil {
+	if idle <= 0 {
+		// Go 的零值 net.Dialer 默认会为拨出连接开启 keepalive（当前为 15s），
+		// 配置为关闭时必须显式关掉，才能让上游/直连拨出连接真正回到系统默认。
+		if err := conn.SetKeepAlive(false); err != nil {
+			loggo.Debug("disable tcp keepalive fail: %s", err)
+		}
 		return
 	}
 	// 探测间隔取 idle/3（至少 1s），连续 3 次无应答判定死亡，
