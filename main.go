@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.11"
+	version = "0.7.12"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -403,10 +403,11 @@ func renderStats(now time.Time) string {
 				state = "dead"
 			}
 		}
-		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d",
+		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f",
 			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
 			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load(),
-			h.probeAttempts.Load(), h.probeFails.Load())
+			h.probeAttempts.Load(), h.probeFails.Load(),
+			float64(h.probeLastNS.Load())/1e6, probeAvgMS(h))
 		if state == "dead" || state == "half_open" {
 			if deadAt := h.deadAt.Load(); deadAt > 0 {
 				fmt.Fprintf(&b, " removed_since=%s", now.Sub(time.Unix(0, deadAt)).Round(time.Second))
@@ -445,6 +446,11 @@ func promLabelValue(s string) string {
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	s = strings.ReplaceAll(s, "\n", `\n`)
 	return s
+}
+
+// formatProbeSeconds 将纳秒探测耗时格式化为 Prometheus 秒值（6 位小数）。
+func formatProbeSeconds(ns int64) string {
+	return strconv.FormatFloat(float64(ns)/float64(time.Second), 'f', 6, 64)
 }
 
 // renderPrometheusMetrics 生成 Prometheus 文本格式（0.0.4）快照，独立于 HTTP
@@ -525,6 +531,8 @@ func renderPrometheusMetrics(now time.Time) string {
 	b.WriteString("# HELP socksfilter_upstream_sessions_established_total Total sessions established successfully via this upstream.\n# TYPE socksfilter_upstream_sessions_established_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_connect_failures_total Total session establishment failures via this upstream.\n# TYPE socksfilter_upstream_connect_failures_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_health_probes_total Active health-check probes against this upstream by outcome.\n# TYPE socksfilter_upstream_health_probes_total counter\n")
+	b.WriteString("# HELP socksfilter_upstream_health_probe_last_duration_seconds Latency of the most recent active health-check probe (TCP connect plus SOCKS5 handshake; 0 until the first probe).\n# TYPE socksfilter_upstream_health_probe_last_duration_seconds gauge\n")
+	b.WriteString("# HELP socksfilter_upstream_health_probe_duration_seconds Active health-check probe latency (TCP connect plus SOCKS5 handshake) in seconds; both successful and failed probes are observed.\n# TYPE socksfilter_upstream_health_probe_duration_seconds histogram\n")
 	for _, server := range strings.Fields(*servers) {
 		h := getUpstreamHealth(server)
 		up := int64(0)
@@ -541,6 +549,21 @@ func renderPrometheusMetrics(now time.Time) string {
 			promLabelValue(server), h.probeAttempts.Load()-h.probeFails.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_health_probes_total{upstream=\"%s\",outcome=\"failure\"} %d\n",
 			promLabelValue(server), h.probeFails.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_last_duration_seconds{upstream=\"%s\"} %s\n",
+			promLabelValue(server), formatProbeSeconds(h.probeLastNS.Load()))
+		// 直方图观测桶以非累积形式存储，渲染时现场累加；+Inf/count 取探测总次数。
+		var bucketCumulative int64
+		for i, upperBound := range probeLatencyUpperBounds {
+			bucketCumulative += h.probeLatencyBuckets[i].Load()
+			fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_bucket{upstream=\"%s\",le=\"%s\"} %d\n",
+				promLabelValue(server), strconv.FormatFloat(upperBound, 'f', -1, 64), bucketCumulative)
+		}
+		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_bucket{upstream=\"%s\",le=\"+Inf\"} %d\n",
+			promLabelValue(server), h.probeAttempts.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_sum{upstream=\"%s\"} %s\n",
+			promLabelValue(server), formatProbeSeconds(h.probeSumNS.Load()))
+		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_count{upstream=\"%s\"} %d\n",
+			promLabelValue(server), h.probeAttempts.Load())
 		routeLabel := fmt.Sprintf("{route=\"%s\"", promLabelValue(server))
 		fmt.Fprintf(&b, "socksfilter_relay_bytes_total%s,direction=\"%s\"} %d\n",
 			routeLabel, "client_to_target", h.bytesC2T.Load())
@@ -889,7 +912,19 @@ type upstreamHealth struct {
 	// 二者之差即探测成功次数，用于评估探测失败率与健康检查参数。
 	probeAttempts atomic.Int64
 	probeFails    atomic.Int64
+
+	// 主动探测延迟：probeLastNS 为最近一次探测耗时（未探测过为 0），
+	// probeSumNS 为累计耗时（配合 probeAttempts 可得平均耗时）；
+	// probeLatencyBuckets 保存非累积的直方图观测桶，渲染 Prometheus 时
+	// 再现场累加为累积桶，超过最大上界的观测只落入 +Inf。
+	probeLastNS         atomic.Int64
+	probeSumNS          atomic.Int64
+	probeLatencyBuckets [len(probeLatencyUpperBounds)]atomic.Int64
 }
+
+// probeLatencyUpperBounds 为主动探测延迟直方图的有限桶上界（秒），对齐
+// Prometheus 默认延迟桶；超过最后一个上界的观测仅计入 +Inf 桶。
+var probeLatencyUpperBounds = [...]float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
 
 var gUpstreamHealth sync.Map // server -> *upstreamHealth
 
@@ -951,6 +986,31 @@ func reportUpstreamSuccess(server string) {
 	}
 }
 
+// recordProbeLatency 记录一次主动探测的端到端耗时（TCP 连接 + SOCKS5 握手，
+// 成功与失败均记录）：更新最近值、累计和，并给首个不小于耗时的桶 +1。
+func (h *upstreamHealth) recordProbeLatency(d time.Duration) {
+	ns := d.Nanoseconds()
+	h.probeLastNS.Store(ns)
+	h.probeSumNS.Add(ns)
+	secs := float64(ns) / float64(time.Second)
+	for i, upperBound := range probeLatencyUpperBounds {
+		if secs <= upperBound {
+			h.probeLatencyBuckets[i].Add(1)
+			return
+		}
+	}
+	// 超过最大有限桶上界：仅计入渲染时的 +Inf 桶
+}
+
+// probeAvgMS 返回累计平均主动探测耗时（毫秒）；尚无探测时为 0。
+func probeAvgMS(h *upstreamHealth) float64 {
+	n := h.probeAttempts.Load()
+	if n == 0 {
+		return 0
+	}
+	return float64(h.probeSumNS.Load()) / 1e6 / float64(n)
+}
+
 // probeUpstream 对上游做一次探测：TCP 连接 + SOCKS5 客户端握手（含账密认证）。
 func probeUpstream(server string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -974,6 +1034,8 @@ func probeUpstream(server string, timeout time.Duration) error {
 func checkUpstream(server string, timeout time.Duration) bool {
 	h := getUpstreamHealth(server)
 	h.probeAttempts.Add(1)
+	start := time.Now()
+	defer func() { h.recordProbeLatency(time.Since(start)) }()
 	if err := probeUpstream(server, timeout); err != nil {
 		h.probeFails.Add(1)
 		if h.recordFailure(time.Now()) {

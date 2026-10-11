@@ -1279,11 +1279,31 @@ func TestHealthCheckProbeCounters(t *testing.T) {
 		t.Errorf("probe successes=%d, want 1", got)
 	}
 
+	// 每次探测（成功/失败均含）都应记录耗时：超时上限 2s，3 次观测必然全部
+	// 落在 10s 以内的有限桶中，累计和不小于最近一次耗时。
+	if h.probeLastNS.Load() <= 0 {
+		t.Error("probeLastNS not recorded")
+	}
+	if h.probeSumNS.Load() < h.probeLastNS.Load() {
+		t.Errorf("probeSumNS=%d < probeLastNS=%d", h.probeSumNS.Load(), h.probeLastNS.Load())
+	}
+	var inFiniteBuckets int64
+	for i := range h.probeLatencyBuckets {
+		inFiniteBuckets += h.probeLatencyBuckets[i].Load()
+	}
+	if inFiniteBuckets != 3 {
+		t.Errorf("observations in finite buckets=%d, want 3 (probe timeout 2s < 10s max bound)", inFiniteBuckets)
+	}
+
 	// 被动失败反馈只影响健康状态，不计入主动探测桶
 	beforeA, beforeF := h.probeAttempts.Load(), h.probeFails.Load()
+	beforeLast, beforeSum := h.probeLastNS.Load(), h.probeSumNS.Load()
 	reportUpstreamFailure(addr, "synthetic passive failure")
 	if h.probeAttempts.Load() != beforeA || h.probeFails.Load() != beforeF {
 		t.Error("passive traffic failure must not move active probe counters")
+	}
+	if h.probeLastNS.Load() != beforeLast || h.probeSumNS.Load() != beforeSum {
+		t.Error("passive traffic failure must not move active probe latency")
 	}
 }
 
@@ -3518,6 +3538,8 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	getUpstreamHealth(srv0).sessionsActive.Store(7)
 	getUpstreamHealth(srv0).probeAttempts.Store(60)
 	getUpstreamHealth(srv0).probeFails.Store(6)
+	getUpstreamHealth(srv0).probeLastNS.Store(1_500_000) // 1.5ms
+	getUpstreamHealth(srv0).probeSumNS.Store(6_000_000)  // avg 0.1ms over 60 probes
 	directSessActive := gRouteSessionsActiveDirect.Load()
 	directSessTotal := gRouteSessionsTotalDirect.Load()
 	gRouteSessionsActiveDirect.Store(21)
@@ -3540,13 +3562,15 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		if line == "" {
 			t.Fatalf("missing upstream line for %s", srv)
 		}
-		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0"}
+		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0", "probe_last_ms=0.000", "probe_avg_ms=0.000"}
 		if srv == srv0 {
 			wants[3] = "bytes_c2t=111"
 			wants[4] = "bytes_t2c=222"
 			wants[5] = "sessions_active=7"
 			wants[6] = "probe_attempts=60"
 			wants[7] = "probe_fails=6"
+			wants[8] = "probe_last_ms=1.500"
+			wants[9] = "probe_avg_ms=0.100"
 		}
 		for _, want := range wants {
 			if !strings.Contains(line, want) {
@@ -3803,28 +3827,30 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 
 	// 所有指标族都必须声明正确的类型
 	for name, typ := range map[string]string{
-		"socksfilter_build_info":                          "gauge",
-		"socksfilter_tcp_connections_active":              "gauge",
-		"socksfilter_tcp_connections_total":               "counter",
-		"socksfilter_tcp_connections_rejected_total":      "counter",
-		"socksfilter_udp_associations_active":             "gauge",
-		"socksfilter_udp_associations_total":              "counter",
-		"socksfilter_tcp_relay_bytes_total":               "counter",
-		"socksfilter_relay_bytes_total":                   "counter",
-		"socksfilter_route_sessions_active":               "gauge",
-		"socksfilter_route_sessions_total":                "counter",
-		"socksfilter_dns_lookups_total":                   "counter",
-		"socksfilter_dns_resolutions_total":               "counter",
-		"socksfilter_dns_cache_entries":                   "gauge",
-		"socksfilter_idle_timeout_closed_total":           "counter",
-		"socksfilter_entry_errors_total":                  "counter",
-		"socksfilter_max_connections":                     "gauge",
-		"socksfilter_upstream_up":                         "gauge",
-		"socksfilter_upstream_consecutive_failures":       "gauge",
-		"socksfilter_upstream_session_attempts_total":     "counter",
-		"socksfilter_upstream_sessions_established_total": "counter",
-		"socksfilter_upstream_connect_failures_total":     "counter",
-		"socksfilter_upstream_health_probes_total":        "counter",
+		"socksfilter_build_info":                                  "gauge",
+		"socksfilter_tcp_connections_active":                      "gauge",
+		"socksfilter_tcp_connections_total":                       "counter",
+		"socksfilter_tcp_connections_rejected_total":              "counter",
+		"socksfilter_udp_associations_active":                     "gauge",
+		"socksfilter_udp_associations_total":                      "counter",
+		"socksfilter_tcp_relay_bytes_total":                       "counter",
+		"socksfilter_relay_bytes_total":                           "counter",
+		"socksfilter_route_sessions_active":                       "gauge",
+		"socksfilter_route_sessions_total":                        "counter",
+		"socksfilter_dns_lookups_total":                           "counter",
+		"socksfilter_dns_resolutions_total":                       "counter",
+		"socksfilter_dns_cache_entries":                           "gauge",
+		"socksfilter_idle_timeout_closed_total":                   "counter",
+		"socksfilter_entry_errors_total":                          "counter",
+		"socksfilter_max_connections":                             "gauge",
+		"socksfilter_upstream_up":                                 "gauge",
+		"socksfilter_upstream_consecutive_failures":               "gauge",
+		"socksfilter_upstream_session_attempts_total":             "counter",
+		"socksfilter_upstream_sessions_established_total":         "counter",
+		"socksfilter_upstream_connect_failures_total":             "counter",
+		"socksfilter_upstream_health_probes_total":                "counter",
+		"socksfilter_upstream_health_probe_last_duration_seconds": "gauge",
+		"socksfilter_upstream_health_probe_duration_seconds":      "histogram",
 	} {
 		if !strings.Contains(text, "# TYPE "+name+" "+typ) {
 			t.Errorf("missing TYPE declaration for %s %s", name, typ)
@@ -3856,8 +3882,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 51 {
-		t.Fatalf("expected >=51 metric samples, got %d", samples)
+	if samples < 96 {
+		t.Fatalf("expected >=96 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -4145,6 +4171,80 @@ func TestPrometheusMetricsHealthProbes(t *testing.T) {
 			if !strings.Contains(text, want) {
 				t.Errorf("metrics output missing zero sample %q", want)
 			}
+		}
+	}
+}
+
+// TestRecordProbeLatencyBuckets 验证观测桶边界：恰好等于上界落入该桶（<=），
+// 超过最大上界 10s 的观测不进入任何有限桶（渲染时仅计入 +Inf）。
+func TestRecordProbeLatencyBuckets(t *testing.T) {
+	h := &upstreamHealth{}
+	h.recordProbeLatency(5 * time.Millisecond)             // 恰好 0.005s -> 第一个有限桶
+	h.recordProbeLatency(10 * time.Second)                 // 恰好最大上界 -> 最后一个有限桶
+	h.recordProbeLatency(10*time.Second + time.Nanosecond) // 溢出 -> 仅 +Inf
+	if h.probeLatencyBuckets[0].Load() != 1 {
+		t.Errorf("first bucket=%d, want 1", h.probeLatencyBuckets[0].Load())
+	}
+	last := len(probeLatencyUpperBounds) - 1
+	if h.probeLatencyBuckets[last].Load() != 1 {
+		t.Errorf("last finite bucket=%d, want 1", h.probeLatencyBuckets[last].Load())
+	}
+	var finite int64
+	for i := range h.probeLatencyBuckets {
+		finite += h.probeLatencyBuckets[i].Load()
+	}
+	if finite != 2 {
+		t.Errorf("finite bucket observations=%d, want 2", finite)
+	}
+}
+
+// TestPrometheusMetricsProbeLatency 验证探测延迟 gauge 与直方图：3 次观测
+// （0.0001s / 3s / 30s），有限桶按累积口径渲染，30s 只落入 +Inf，
+// sum=33.0001s、count 与 +Inf 均等于探测总次数 3。
+func TestPrometheusMetricsProbeLatency(t *testing.T) {
+	oldServers := *servers
+	srv := "127.0.0.1:19999"
+	*servers = srv
+	resetUpstreamHealth()
+	t.Cleanup(func() {
+		*servers = oldServers
+		resetUpstreamHealth()
+	})
+
+	h := getUpstreamHealth(srv)
+	h.probeAttempts.Store(3)
+	h.recordProbeLatency(100 * time.Microsecond) // 0.0001s -> le=0.005
+	h.recordProbeLatency(3 * time.Second)        // 3s -> le=5
+	h.recordProbeLatency(30 * time.Second)       // 超过 10s，仅进 +Inf
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_health_probe_last_duration_seconds gauge") {
+		t.Fatal("missing TYPE for last duration gauge")
+	}
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_health_probe_duration_seconds histogram") {
+		t.Fatal("missing TYPE for duration histogram")
+	}
+	if want := `socksfilter_upstream_health_probe_last_duration_seconds{upstream="127.0.0.1:19999"} 30.000000`; !strings.Contains(text, want) {
+		t.Errorf("missing last-duration sample %q", want)
+	}
+	for _, c := range []struct {
+		le string
+		v  int64
+	}{
+		{"0.005", 1}, {"0.01", 1}, {"0.025", 1}, {"0.05", 1}, {"0.1", 1}, {"0.25", 1},
+		{"0.5", 1}, {"1", 1}, {"2.5", 1}, {"5", 2}, {"10", 2}, {"+Inf", 3},
+	} {
+		want := fmt.Sprintf(`socksfilter_upstream_health_probe_duration_seconds_bucket{upstream=%q,le=%q} %d`, srv, c.le, c.v)
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		`socksfilter_upstream_health_probe_duration_seconds_sum{upstream="127.0.0.1:19999"} 33.000100`,
+		`socksfilter_upstream_health_probe_duration_seconds_count{upstream="127.0.0.1:19999"} 3`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
 		}
 	}
 }
