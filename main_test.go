@@ -1247,6 +1247,46 @@ func TestHealthCheckDeadThenRecover(t *testing.T) {
 	}
 }
 
+// TestHealthCheckProbeCounters 验证主动健康探测计数：前 2 次失败第 3 次成功的
+// gated 上游，probeAttempts=3、probeFails=2（成功次数=差值 1）；被动流量
+// 反馈不经过 checkUpstream，不得计入探测桶。
+func TestHealthCheckProbeCounters(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	addr, cleanup := startGatedSocks5(t, 2)
+	defer cleanup()
+
+	timeout := 2 * time.Second
+	if checkUpstream(addr, timeout) {
+		t.Fatal("first probe expected to fail")
+	}
+	if checkUpstream(addr, timeout) {
+		t.Fatal("second probe expected to fail")
+	}
+	if !checkUpstream(addr, timeout) {
+		t.Fatal("third probe expected to succeed")
+	}
+
+	h := getUpstreamHealth(addr)
+	if got := h.probeAttempts.Load(); got != 3 {
+		t.Errorf("probeAttempts=%d, want 3", got)
+	}
+	if got := h.probeFails.Load(); got != 2 {
+		t.Errorf("probeFails=%d, want 2", got)
+	}
+	if got := h.probeAttempts.Load() - h.probeFails.Load(); got != 1 {
+		t.Errorf("probe successes=%d, want 1", got)
+	}
+
+	// 被动失败反馈只影响健康状态，不计入主动探测桶
+	beforeA, beforeF := h.probeAttempts.Load(), h.probeFails.Load()
+	reportUpstreamFailure(addr, "synthetic passive failure")
+	if h.probeAttempts.Load() != beforeA || h.probeFails.Load() != beforeF {
+		t.Error("passive traffic failure must not move active probe counters")
+	}
+}
+
 func TestHealthCheckUnreachableDead(t *testing.T) {
 	resetUpstreamHealth()
 	t.Cleanup(resetUpstreamHealth)
@@ -3476,6 +3516,8 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	getUpstreamHealth(srv0).bytesC2T.Store(111)
 	getUpstreamHealth(srv0).bytesT2C.Store(222)
 	getUpstreamHealth(srv0).sessionsActive.Store(7)
+	getUpstreamHealth(srv0).probeAttempts.Store(60)
+	getUpstreamHealth(srv0).probeFails.Store(6)
 	directSessActive := gRouteSessionsActiveDirect.Load()
 	directSessTotal := gRouteSessionsTotalDirect.Load()
 	gRouteSessionsActiveDirect.Store(21)
@@ -3498,11 +3540,13 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		if line == "" {
 			t.Fatalf("missing upstream line for %s", srv)
 		}
-		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0"}
+		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0"}
 		if srv == srv0 {
 			wants[3] = "bytes_c2t=111"
 			wants[4] = "bytes_t2c=222"
 			wants[5] = "sessions_active=7"
+			wants[6] = "probe_attempts=60"
+			wants[7] = "probe_fails=6"
 		}
 		for _, want := range wants {
 			if !strings.Contains(line, want) {
@@ -3780,6 +3824,7 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_upstream_session_attempts_total":     "counter",
 		"socksfilter_upstream_sessions_established_total": "counter",
 		"socksfilter_upstream_connect_failures_total":     "counter",
+		"socksfilter_upstream_health_probes_total":        "counter",
 	} {
 		if !strings.Contains(text, "# TYPE "+name+" "+typ) {
 			t.Errorf("missing TYPE declaration for %s %s", name, typ)
@@ -3811,8 +3856,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 45 {
-		t.Fatalf("expected >=45 metric samples, got %d", samples)
+	if samples < 51 {
+		t.Fatalf("expected >=51 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -4065,6 +4110,41 @@ func TestPrometheusMetricsEntryErrors(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+// TestPrometheusMetricsHealthProbes 验证主动健康探测 counter：srv0 写入
+// 10 次探测/3 次失败后输出 success=7、failure=3；其余上游输出两个零值样本。
+func TestPrometheusMetricsHealthProbes(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	srv0 := strings.Fields(*servers)[0]
+	getUpstreamHealth(srv0).probeAttempts.Store(10)
+	getUpstreamHealth(srv0).probeFails.Store(3)
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_health_probes_total counter") {
+		t.Fatal("missing TYPE declaration for socksfilter_upstream_health_probes_total")
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`socksfilter_upstream_health_probes_total{upstream=%q,outcome="success"} 7`, srv0),
+		fmt.Sprintf(`socksfilter_upstream_health_probes_total{upstream=%q,outcome="failure"} 3`, srv0),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+	for _, srv := range strings.Fields(*servers) {
+		if srv == srv0 {
+			continue
+		}
+		for _, outcome := range []string{"success", "failure"} {
+			want := fmt.Sprintf(`socksfilter_upstream_health_probes_total{upstream=%q,outcome=%q} 0`, srv, outcome)
+			if !strings.Contains(text, want) {
+				t.Errorf("metrics output missing zero sample %q", want)
+			}
 		}
 	}
 }

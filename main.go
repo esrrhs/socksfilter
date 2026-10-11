@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.10"
+	version = "0.7.11"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -403,9 +403,10 @@ func renderStats(now time.Time) string {
 				state = "dead"
 			}
 		}
-		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d",
+		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d",
 			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
-			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load())
+			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load(),
+			h.probeAttempts.Load(), h.probeFails.Load())
 		if state == "dead" || state == "half_open" {
 			if deadAt := h.deadAt.Load(); deadAt > 0 {
 				fmt.Fprintf(&b, " removed_since=%s", now.Sub(time.Unix(0, deadAt)).Round(time.Second))
@@ -523,6 +524,7 @@ func renderPrometheusMetrics(now time.Time) string {
 	b.WriteString("# HELP socksfilter_upstream_session_attempts_total Total session establishment attempts via this upstream (TCP CONNECT plus UDP ASSOCIATE; reused UDP sessions not recounted).\n# TYPE socksfilter_upstream_session_attempts_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_sessions_established_total Total sessions established successfully via this upstream.\n# TYPE socksfilter_upstream_sessions_established_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_connect_failures_total Total session establishment failures via this upstream.\n# TYPE socksfilter_upstream_connect_failures_total counter\n")
+	b.WriteString("# HELP socksfilter_upstream_health_probes_total Active health-check probes against this upstream by outcome.\n# TYPE socksfilter_upstream_health_probes_total counter\n")
 	for _, server := range strings.Fields(*servers) {
 		h := getUpstreamHealth(server)
 		up := int64(0)
@@ -535,6 +537,10 @@ func renderPrometheusMetrics(now time.Time) string {
 		fmt.Fprintf(&b, "socksfilter_upstream_session_attempts_total%s %d\n", label, h.attempts.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_sessions_established_total%s %d\n", label, h.established.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_connect_failures_total%s %d\n", label, h.connectFails.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_health_probes_total{upstream=\"%s\",outcome=\"success\"} %d\n",
+			promLabelValue(server), h.probeAttempts.Load()-h.probeFails.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_health_probes_total{upstream=\"%s\",outcome=\"failure\"} %d\n",
+			promLabelValue(server), h.probeFails.Load())
 		routeLabel := fmt.Sprintf("{route=\"%s\"", promLabelValue(server))
 		fmt.Fprintf(&b, "socksfilter_relay_bytes_total%s,direction=\"%s\"} %d\n",
 			routeLabel, "client_to_target", h.bytesC2T.Load())
@@ -877,6 +883,12 @@ type upstreamHealth struct {
 	// sessionsActive 为当前经该出口传输中的会话数（TCP CONNECT 隧道 +
 	// UDP 上游会话），建立成功时 +1、会话关闭时 -1（closeOnce 保证恰好一次）。
 	sessionsActive atomic.Int64
+
+	// 主动健康检查探测（healthCheckLoop，区别于 fails 混合计入的被动流量
+	// 反馈）：probeAttempts 为累计探测次数，probeFails 为其中探测失败次数，
+	// 二者之差即探测成功次数，用于评估探测失败率与健康检查参数。
+	probeAttempts atomic.Int64
+	probeFails    atomic.Int64
 }
 
 var gUpstreamHealth sync.Map // server -> *upstreamHealth
@@ -961,7 +973,9 @@ func probeUpstream(server string, timeout time.Duration) error {
 // 连续 healthFailThreshold 次失败判定为不可用，一次成功即恢复。
 func checkUpstream(server string, timeout time.Duration) bool {
 	h := getUpstreamHealth(server)
+	h.probeAttempts.Add(1)
 	if err := probeUpstream(server, timeout); err != nil {
+		h.probeFails.Add(1)
 		if h.recordFailure(time.Now()) {
 			loggo.Info("upstream health check dead: %s err %s", server, err)
 		}
