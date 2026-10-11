@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,8 +31,9 @@ import (
 )
 
 var (
-	version = "0.7.4"
+	version = "0.7.5"
 
+	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
 	servers            = flag.String("s", "server1 server2 server3", "server addr")
 	sel                = flag.String("select", "robin", "select server robin/rand/hash_by_dst_ip/hash_by_src_ip/hash_all")
@@ -79,8 +81,78 @@ var (
 	gRejectedConns       atomic.Int64 // 因 -max-conn 上限被拒绝的会话累计数
 )
 
+// loadFlagsFromConfig 从 JSON 配置文件填充未在命令行显式指定的 flag。
+// JSON 的 key 必须与 flag 名一致（如 "s"、"dial-timeout"），value 支持
+// JSON string / bool / number（number 以原始词法文本交给 flag 解析，
+// 避免浮点精度损失）。命令行显式给出的 flag 优先，配置文件不得覆盖。
+func loadFlagsFromConfig(fs *flag.FlagSet, path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config %q: %w", path, err)
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	var vals map[string]any
+	if err := dec.Decode(&vals); err != nil {
+		return fmt.Errorf("parse config %q: %w", path, err)
+	}
+
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	names := make([]string, 0, len(vals))
+	for k := range vals {
+		names = append(names, k)
+	}
+	slices.Sort(names) // 稳定错误顺序
+
+	for _, name := range names {
+		if name == "config" {
+			return fmt.Errorf("config %q: flag %q cannot be set inside the config file", path, name)
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			return fmt.Errorf("config %q: unknown flag %q", path, name)
+		}
+		if explicit[name] {
+			continue // 命令行显式指定，优先级最高
+		}
+		text, err := configValueText(vals[name])
+		if err != nil {
+			return fmt.Errorf("config %q: flag %q: %w", path, name, err)
+		}
+		if err := fs.Set(name, text); err != nil {
+			return fmt.Errorf("config %q: set -%s=%q: %w", path, name, text, err)
+		}
+	}
+	return nil
+}
+
+// configValueText 把 JSON 值转换为 flag.Value.Set 接受的文本形式。
+func configValueText(v any) (string, error) {
+	switch x := v.(type) {
+	case string:
+		return x, nil
+	case bool:
+		return strconv.FormatBool(x), nil
+	case json.Number:
+		return x.String(), nil
+	case nil:
+		return "", errors.New("null is not a valid flag value")
+	default:
+		return "", fmt.Errorf("unsupported value type %T (only string/number/boolean)", v)
+	}
+}
+
 func main() {
 	flag.Parse()
+
+	if *configPath != "" {
+		if err := loadFlagsFromConfig(flag.CommandLine, *configPath); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	}
 
 	if *showVersion {
 		fmt.Printf("socksfilter version %s\n", version)

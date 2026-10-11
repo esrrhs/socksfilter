@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -3265,5 +3268,180 @@ func TestPromLabelValueEscape(t *testing.T) {
 d`)
 	if got != `a\"b\\c\nd` {
 		t.Errorf("unexpected escaping: %q", got)
+	}
+}
+
+// ---- -config JSON 配置文件 ----
+
+// newConfigTestFlagSet 构造与真实 flag 类型分布一致的独立集合，避免污染
+// 全局 flag.CommandLine。
+func newConfigTestFlagSet() *flag.FlagSet {
+	fs := flag.NewFlagSet("testconfig", flag.ContinueOnError)
+	fs.String("l", ":1080", "")
+	fs.String("s", "server1 server2 server3", "")
+	fs.Int("dial-timeout", 10, "")
+	fs.Int("max-conn", 0, "")
+	fs.Bool("version", false, "")
+	fs.String("config", "", "")
+	return fs
+}
+
+func writeConfigFile(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config fail: %v", err)
+	}
+	return path
+}
+
+func TestConfigLoadsStringIntBool(t *testing.T) {
+	fs := newConfigTestFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	path := writeConfigFile(t, `{
+		"l": "127.0.0.1:1080",
+		"s": "up1:1080 up2:1080",
+		"dial-timeout": 7,
+		"max-conn": 100,
+		"version": true
+	}`)
+	if err := loadFlagsFromConfig(fs, path); err != nil {
+		t.Fatalf("load fail: %v", err)
+	}
+	if got := fs.Lookup("l").Value.String(); got != "127.0.0.1:1080" {
+		t.Errorf("l=%q", got)
+	}
+	if got := fs.Lookup("s").Value.String(); got != "up1:1080 up2:1080" {
+		t.Errorf("s=%q", got)
+	}
+	if got := fs.Lookup("dial-timeout").Value.String(); got != "7" {
+		t.Errorf("dial-timeout=%q", got)
+	}
+	if got := fs.Lookup("max-conn").Value.String(); got != "100" {
+		t.Errorf("max-conn=%q", got)
+	}
+	if got := fs.Lookup("version").Value.String(); got != "true" {
+		t.Errorf("version=%q", got)
+	}
+}
+
+func TestConfigCLIExplicitWins(t *testing.T) {
+	fs := newConfigTestFlagSet()
+	if err := fs.Parse([]string{"-dial-timeout", "42", "-s", "cli:1"}); err != nil {
+		t.Fatal(err)
+	}
+	path := writeConfigFile(t, `{
+		"dial-timeout": 7,
+		"s": "fromfile:2",
+		"l": "fromfile:1080"
+	}`)
+	if err := loadFlagsFromConfig(fs, path); err != nil {
+		t.Fatalf("load fail: %v", err)
+	}
+	if got := fs.Lookup("dial-timeout").Value.String(); got != "42" {
+		t.Errorf("explicit int flag overridden: %s", got)
+	}
+	if got := fs.Lookup("s").Value.String(); got != "cli:1" {
+		t.Errorf("explicit string flag overridden: %s", got)
+	}
+	if got := fs.Lookup("l").Value.String(); got != "fromfile:1080" {
+		t.Errorf("non-explicit flag should come from file: %s", got)
+	}
+}
+
+func TestConfigNumberKeepsIntegerLexeme(t *testing.T) {
+	fs := newConfigTestFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	path := writeConfigFile(t, `{"max-conn": 86400, "dial-timeout": -3}`)
+	if err := loadFlagsFromConfig(fs, path); err != nil {
+		t.Fatalf("load fail: %v", err)
+	}
+	if got := fs.Lookup("max-conn").Value.String(); got != "86400" {
+		t.Errorf("large integer mangled: %s", got)
+	}
+	if got := fs.Lookup("dial-timeout").Value.String(); got != "-3" {
+		t.Errorf("negative integer mangled: %s", got)
+	}
+}
+
+func TestConfigErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		wantSub string
+	}{
+		{"malformed json", `{"s": }`, "parse config"},
+		{"not an object", `["s"]`, "cannot unmarshal"},
+		{"unknown flag", `{"nope": 1}`, "unknown flag"},
+		{"config inside config", `{"config": "x.json"}`, `cannot be set`},
+		{"null value", `{"s": null}`, "null is not"},
+		{"array value", `{"s": ["a"]}`, "unsupported value type"},
+		{"object value", `{"s": {"a": 1}}`, "unsupported value type"},
+		{"wrong value type for int", `{"dial-timeout": "abc"}`, "set -dial-timeout"},
+		{"top-level scalar", `"s"`, "cannot unmarshal"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newConfigTestFlagSet()
+			if err := fs.Parse(nil); err != nil {
+				t.Fatal(err)
+			}
+			path := writeConfigFile(t, tc.content)
+			err := loadFlagsFromConfig(fs, path)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestConfigFileMissing(t *testing.T) {
+	fs := newConfigTestFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	err := loadFlagsFromConfig(fs, filepath.Join(t.TempDir(), "absent.json"))
+	if err == nil || !strings.Contains(err.Error(), "read config") {
+		t.Fatalf("expected read error, got %v", err)
+	}
+}
+
+func TestConfigEmptyFileIsNoop(t *testing.T) {
+	fs := newConfigTestFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	path := writeConfigFile(t, `{}`)
+	if err := loadFlagsFromConfig(fs, path); err != nil {
+		t.Fatalf("empty object should be valid, got %v", err)
+	}
+	if got := fs.Lookup("l").Value.String(); got != ":1080" {
+		t.Errorf("defaults changed unexpectedly: l=%s", got)
+	}
+	if got := fs.Lookup("dial-timeout").Value.String(); got != "10" {
+		t.Errorf("defaults changed unexpectedly: dial-timeout=%s", got)
+	}
+}
+
+func TestConfigStringAcceptedByBoolFlag(t *testing.T) {
+	// 字符串 "false" 经 flag 包解析为 false：与命令行 -version=false 行为一致。
+	fs := newConfigTestFlagSet()
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	path := writeConfigFile(t, `{"version": "false"}`)
+	if err := loadFlagsFromConfig(fs, path); err != nil {
+		t.Fatalf("load fail: %v", err)
+	}
+	if got := fs.Lookup("version").Value.String(); got != "false" {
+		t.Errorf("version=%q", got)
 	}
 }

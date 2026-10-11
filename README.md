@@ -19,6 +19,7 @@ A lightweight SOCKS5 traffic routing and aggregation proxy filter.
   * **GeoIP Country Filtering**: Filters based on destination IP country code (default `CN`). Matches connect directly; non-matches are routed to upstream SOCKS5 servers.
   * **High-Performance DNS Cache**: Built-in multi-core concurrent LRU cache and singleflight deduplication to reduce redundant DNS lookups.
 * **Upstream SOCKS5 Authentication**: Forwards username/password credentials (RFC 1929) to upstream SOCKS5 servers for both TCP CONNECT and UDP ASSOCIATE.
+* **JSON Config File**: `-config file.json` can supply every flag; explicit command-line flags take precedence.
 * **Upstream Health Checks (Active + Passive)**: Actively probes each upstream periodically (TCP connect + SOCKS5 handshake, using `-susername`/`-spassword`), and also learns from real traffic — TCP/UDP dial, handshake, or UDP relay-write failures feed the same health state while successes clear it. An upstream failing two consecutive checks is removed from candidate selection. After a cooldown it enters half-open state and retries with a single request, recovering on success or re-entering cooldown on failure (cooldown equals the probe interval, or 10s when active probing is disabled). If every upstream is down, selection fails open to on-demand failover.
 * **Upstream Multi-Server Load Balancing**: Aggregates multiple backend SOCKS5 servers with flexible load balancing strategies:
   * `robin`: Thread-safe Round-Robin rotation.
@@ -42,6 +43,29 @@ Listen on port 1080, bypass CN traffic directly, and route non-CN traffic throug
 ```bash
 ./socksfilter -s "yourserver1:1080 yourserver2:1080 yourserver3:1080"
 ```
+
+### Configuration File
+All flags can optionally be supplied as a JSON file via `-config`:
+```json
+{
+  "l": ":1080",
+  "s": "yourserver1:1080 yourserver2:1080",
+  "select": "robin",
+  "dial-timeout": 10,
+  "tcp-keepalive": 30,
+  "max-conn": 1000,
+  "stats-addr": "127.0.0.1:7070",
+  "susername": "user",
+  "spassword": "pass"
+}
+```
+```bash
+./socksfilter -config /etc/socksfilter/config.json
+```
+Rules:
+- JSON keys are flag names exactly as shown by `-h`; values are strings, numbers, or booleans. Multi-value flags such as `-s` stay space-separated inside one string.
+- Precedence: explicit command-line flags > config file > built-in defaults (e.g. `-s cli:1 -config config.json` keeps `cli:1`).
+- Unknown keys, malformed JSON, `null`, array/object values, or the `config` key itself make the process exit with an error; an empty `{}` is a no-op.
 
 ### Docker
 Run directly using the pre-built Docker image:
@@ -101,6 +125,8 @@ Usage of ./socksfilter:
     	cache size for dns (default 1000)
   -china_domains string
     	china domains file (default "accelerated-domains.china.conf")
+  -config string
+    	load flags from a JSON config file; explicit command-line flags take precedence
   -dial-timeout int
     	tcp dial timeout in seconds for upstream and direct targets (default 10)
   -file string
