@@ -1537,8 +1537,97 @@ func TestReportUpstreamFailureStageBuckets(t *testing.T) {
 	probeSrv := "127.0.0.1:1"
 	checkUpstream(probeSrv, time.Second)
 	ph := getUpstreamHealth(probeSrv)
-	if ph.trafficFailsDial.Load()+ph.trafficFailsHandshake.Load()+ph.trafficFailsWrite.Load() != 0 {
+	if ph.trafficFailsDial.Load()+ph.trafficFailsHandshake.Load()+ph.trafficFailsRequest.Load()+ph.trafficFailsWrite.Load() != 0 {
 		t.Error("active probe failure must not move passive traffic failure buckets")
+	}
+}
+
+// startRequestRejectUpstream 启动一个完成 SOCKS5 方法协商、但对后续
+// CONNECT/UDP ASSOCIATE 请求固定回 REP=rep（非 0 即失败）的 mock 上游。
+func startRequestRejectUpstream(t *testing.T, rep byte) (string, func()) {
+	t.Helper()
+	l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("request-reject upstream listen fail: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, aErr := l.AcceptTCP()
+			if aErr != nil {
+				return
+			}
+			go func(conn *net.TCPConn) {
+				defer conn.Close()
+				if err := network.Sock5HandshakeBy(conn, "", ""); err != nil {
+					return
+				}
+				req := make([]byte, 10) // IPv4 CONNECT 请求帧恰好 10 字节
+				if _, err := io.ReadFull(conn, req); err != nil {
+					return
+				}
+				// VER REP RSV ATYP(IPv4) BND.ADDR(0.0.0.0) BND.PORT(0)
+				_, _ = conn.Write([]byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			}(c)
+		}
+	}()
+	return l.Addr().String(), func() { _ = l.Close(); wg.Wait() }
+}
+
+// TestProxyServerRequestStageFailure 验证 CONNECT 请求阶段失败（上游回
+// REP=1 目标不可达）：traffic_request 计 1，其余阶段桶为 0；该失败
+// 不计入健康摘除（fails=0、上游仍 alive）；会话尝试/失败口径照常入账。
+func TestProxyServerRequestStageFailure(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	upstream, cleanup := startRequestRejectUpstream(t, 0x01)
+	defer cleanup()
+
+	// process_proxy_server 只在成功路径上才使用 client conn，但签名要求
+	// *net.TCPConn，构造一对本地 TCP 连接传入。
+	cl, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("client listen fail: %v", err)
+	}
+	defer cl.Close()
+	cc, err := net.DialTCP("tcp", nil, cl.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatalf("client dial fail: %v", err)
+	}
+	defer cc.Close()
+	peer, err := cl.AcceptTCP()
+	if err != nil {
+		t.Fatalf("accept client conn fail: %v", err)
+	}
+	defer peer.Close()
+
+	if process_proxy_server(context.Background(), cc, "8.8.8.8:53", upstream) {
+		t.Fatal("process_proxy_server must return false on REP=1")
+	}
+
+	h := getUpstreamHealth(upstream)
+	if got := h.trafficFailsRequest.Load(); got != 1 {
+		t.Errorf("traffic_request=%d, want 1", got)
+	}
+	if h.trafficFailsDial.Load() != 0 || h.trafficFailsHandshake.Load() != 0 || h.trafficFailsWrite.Load() != 0 {
+		t.Errorf("other stage buckets must stay zero: dial=%d handshake=%d write=%d",
+			h.trafficFailsDial.Load(), h.trafficFailsHandshake.Load(), h.trafficFailsWrite.Load())
+	}
+	// 请求阶段失败不得摘除健康上游
+	if h.fails.Load() != 0 {
+		t.Errorf("health fails=%d, want 0 (target-unreachable must not mark dead)", h.fails.Load())
+	}
+	if !isServerAlive(upstream) {
+		t.Error("upstream must stay alive after request-stage failure")
+	}
+	if h.attempts.Load() != 1 || h.connectFails.Load() != 1 {
+		t.Errorf("attempts=%d connect_fails=%d, want 1/1", h.attempts.Load(), h.connectFails.Load())
+	}
+	if h.established.Load() != 0 {
+		t.Errorf("established=%d, want 0", h.established.Load())
 	}
 }
 
@@ -3651,6 +3740,7 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	getUpstreamHealth(srv0).recovered.Store(2)
 	getUpstreamHealth(srv0).trafficFailsDial.Store(9)
 	getUpstreamHealth(srv0).trafficFailsHandshake.Store(4)
+	getUpstreamHealth(srv0).trafficFailsRequest.Store(7)
 	getUpstreamHealth(srv0).trafficFailsWrite.Store(1)
 	directSessActive := gRouteSessionsActiveDirect.Load()
 	directSessTotal := gRouteSessionsTotalDirect.Load()
@@ -3674,7 +3764,7 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		if line == "" {
 			t.Fatalf("missing upstream line for %s", srv)
 		}
-		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0", "probe_last_ms=0.000", "probe_avg_ms=0.000", "marked_dead=0", "recovered=0", "traffic_dial=0", "traffic_handshake=0", "traffic_write=0"}
+		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0", "probe_last_ms=0.000", "probe_avg_ms=0.000", "marked_dead=0", "recovered=0", "traffic_dial=0", "traffic_handshake=0", "traffic_request=0", "traffic_write=0"}
 		if srv == srv0 {
 			wants[3] = "bytes_c2t=111"
 			wants[4] = "bytes_t2c=222"
@@ -3687,7 +3777,8 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 			wants[11] = "recovered=2"
 			wants[12] = "traffic_dial=9"
 			wants[13] = "traffic_handshake=4"
-			wants[14] = "traffic_write=1"
+			wants[14] = "traffic_request=7"
+			wants[15] = "traffic_write=1"
 		}
 		for _, want := range wants {
 			if !strings.Contains(line, want) {
@@ -4001,8 +4092,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 111 {
-		t.Fatalf("expected >=111 metric samples, got %d", samples)
+	if samples < 114 {
+		t.Fatalf("expected >=114 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -4404,7 +4495,7 @@ func TestPrometheusMetricsHealthTransitions(t *testing.T) {
 }
 
 // TestPrometheusMetricsTrafficFailures 验证被动流量失败分阶段 counter：
-// srv0 写入 dial=5/handshake=2/write=1 后输出对应样本，其余上游输出零值。
+// srv0 写入 dial=5/handshake=2/request=3/write=1 后输出对应样本，其余上游输出零值。
 func TestPrometheusMetricsTrafficFailures(t *testing.T) {
 	resetUpstreamHealth()
 	t.Cleanup(resetUpstreamHealth)
@@ -4412,6 +4503,7 @@ func TestPrometheusMetricsTrafficFailures(t *testing.T) {
 	srv0 := strings.Fields(*servers)[0]
 	getUpstreamHealth(srv0).trafficFailsDial.Store(5)
 	getUpstreamHealth(srv0).trafficFailsHandshake.Store(2)
+	getUpstreamHealth(srv0).trafficFailsRequest.Store(3)
 	getUpstreamHealth(srv0).trafficFailsWrite.Store(1)
 
 	text := renderPrometheusMetrics(time.Now())
@@ -4421,6 +4513,7 @@ func TestPrometheusMetricsTrafficFailures(t *testing.T) {
 	for _, want := range []string{
 		fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage="dial"} 5`, srv0),
 		fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage="handshake"} 2`, srv0),
+		fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage="request"} 3`, srv0),
 		fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage="write"} 1`, srv0),
 	} {
 		if !strings.Contains(text, want) {
@@ -4431,7 +4524,7 @@ func TestPrometheusMetricsTrafficFailures(t *testing.T) {
 		if srv == srv0 {
 			continue
 		}
-		for _, stage := range []string{"dial", "handshake", "write"} {
+		for _, stage := range []string{"dial", "handshake", "request", "write"} {
 			want := fmt.Sprintf(`socksfilter_upstream_traffic_failures_total{upstream=%q,stage=%q} 0`, srv, stage)
 			if !strings.Contains(text, want) {
 				t.Errorf("metrics output missing zero sample %q", want)

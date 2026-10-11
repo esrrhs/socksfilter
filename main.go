@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.14"
+	version = "0.7.15"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -403,13 +403,13 @@ func renderStats(now time.Time) string {
 				state = "dead"
 			}
 		}
-		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f marked_dead=%d recovered=%d traffic_dial=%d traffic_handshake=%d traffic_write=%d",
+		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f marked_dead=%d recovered=%d traffic_dial=%d traffic_handshake=%d traffic_request=%d traffic_write=%d",
 			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
 			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load(),
 			h.probeAttempts.Load(), h.probeFails.Load(),
 			float64(h.probeLastNS.Load())/1e6, probeAvgMS(h),
 			h.markedDead.Load(), h.recovered.Load(),
-			h.trafficFailsDial.Load(), h.trafficFailsHandshake.Load(), h.trafficFailsWrite.Load())
+			h.trafficFailsDial.Load(), h.trafficFailsHandshake.Load(), h.trafficFailsRequest.Load(), h.trafficFailsWrite.Load())
 		if state == "dead" || state == "half_open" {
 			if deadAt := h.deadAt.Load(); deadAt > 0 {
 				fmt.Fprintf(&b, " removed_since=%s", now.Sub(time.Unix(0, deadAt)).Round(time.Second))
@@ -536,7 +536,7 @@ func renderPrometheusMetrics(now time.Time) string {
 	b.WriteString("# HELP socksfilter_upstream_health_probe_last_duration_seconds Latency of the most recent active health-check probe (TCP connect plus SOCKS5 handshake; 0 until the first probe).\n# TYPE socksfilter_upstream_health_probe_last_duration_seconds gauge\n")
 	b.WriteString("# HELP socksfilter_upstream_health_probe_duration_seconds Active health-check probe latency (TCP connect plus SOCKS5 handshake) in seconds; both successful and failed probes are observed.\n# TYPE socksfilter_upstream_health_probe_duration_seconds histogram\n")
 	b.WriteString("# HELP socksfilter_upstream_health_transitions_total Cumulative health state transitions of this upstream (marked_dead: alive to removed; recovered: removed to alive); driven by active probes and passive traffic feedback.\n# TYPE socksfilter_upstream_health_transitions_total counter\n")
-	b.WriteString("# HELP socksfilter_upstream_traffic_failures_total Passive real-traffic failures while using this upstream, by failure stage (dial: TCP connect; handshake: SOCKS5 method/auth handshake; write: relay write after the session was up); active health probes are excluded.\n# TYPE socksfilter_upstream_traffic_failures_total counter\n")
+	b.WriteString("# HELP socksfilter_upstream_traffic_failures_total Passive real-traffic failures while using this upstream, by failure stage (dial: TCP connect; handshake: SOCKS5 method/auth handshake; request: CONNECT/UDP-ASSOCIATE request phase, including target-unreachable replies, counted without affecting health; write: relay write after the session was up); active health probes are excluded.\n# TYPE socksfilter_upstream_traffic_failures_total counter\n")
 	for _, server := range strings.Fields(*servers) {
 		h := getUpstreamHealth(server)
 		up := int64(0)
@@ -941,10 +941,14 @@ type upstreamHealth struct {
 
 	// 被动流量反馈按失败阶段分类的累计次数（真实代理流量，不含主动探测）：
 	// trafficFailsDial 为 TCP 拨号失败，trafficFailsHandshake 为 SOCKS5 握手/
-	// 认证失败，trafficFailsWrite 为已建立会话的中继写入失败。
+	// 认证失败，trafficFailsWrite 为已建立会话的中继写入失败，
+	// trafficFailsRequest 为拨号+握手成功后的 SOCKS5 请求阶段失败
+	// （TCP CONNECT / UDP ASSOCIATE，含传输错误与上游回的目标不可达应答）；
+	// request 阶段失败只计数、不参与健康摘除，因为健康上游也可能如实上报目标不可达。
 	trafficFailsDial      atomic.Int64
 	trafficFailsHandshake atomic.Int64
 	trafficFailsWrite     atomic.Int64
+	trafficFailsRequest   atomic.Int64
 }
 
 // 被动流量失败阶段标识，用于 reportUpstreamFailure 的分类计数。
@@ -952,12 +956,14 @@ const (
 	trafficFailStageDial      = "dial"
 	trafficFailStageHandshake = "handshake"
 	trafficFailStageWrite     = "write"
+	trafficFailStageRequest   = "request"
 )
 
 // trafficFailStages 为渲染观测端点时的固定阶段顺序。
 var trafficFailStages = []string{
 	trafficFailStageDial,
 	trafficFailStageHandshake,
+	trafficFailStageRequest,
 	trafficFailStageWrite,
 }
 
@@ -1039,11 +1045,21 @@ func (h *upstreamHealth) trafficFailCount(stage string) int64 {
 		return h.trafficFailsDial.Load()
 	case trafficFailStageHandshake:
 		return h.trafficFailsHandshake.Load()
+	case trafficFailStageRequest:
+		return h.trafficFailsRequest.Load()
 	case trafficFailStageWrite:
 		return h.trafficFailsWrite.Load()
 	default:
 		return 0
 	}
+}
+
+// reportUpstreamRequestFailure 记录一次 SOCKS5 请求阶段失败（TCP CONNECT /
+// UDP ASSOCIATE 的请求帧写入/应答读取错误，或上游回的非 0 REP，例如目标不可达）。
+// 只做失败阶段计数，不参与健康摘除：健康上游如实上报目标不可达不应被判定故障。
+func reportUpstreamRequestFailure(server, reason string) {
+	loggo.Info("upstream request-stage failure (not affecting health): %s (%s)", server, reason)
+	getUpstreamHealth(server).trafficFailsRequest.Add(1)
 }
 
 // reportUpstreamSuccess 被动健康反馈：真实流量成功使用上游时调用，
@@ -1713,6 +1729,7 @@ func (assoc *udpAssociation) getOrCreateUpstreamSession(server string) (*udpUpst
 	bnd, err := network.Sock5SetUDPRequest(proxyTCPConn, "0.0.0.0", 0, 5000)
 	if err != nil {
 		_ = proxyTCPConn.Close()
+		reportUpstreamRequestFailure(server, "udp associate request: "+err.Error())
 		return nil, err
 	}
 
@@ -1978,6 +1995,7 @@ func process_proxy_server(ctx context.Context, conn *net.TCPConn, targetAddr str
 	err = network.Sock5SetRequest(proxyconn, dsthost, dstport, 0)
 	if err != nil {
 		loggo.Info("process_proxy_server Sock5SetRequest fail: %s %s", targetAddr, err.Error())
+		reportUpstreamRequestFailure(server, "connect request: "+err.Error())
 		return false
 	}
 
