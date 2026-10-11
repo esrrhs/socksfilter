@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.12"
+	version = "0.7.13"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -403,11 +403,12 @@ func renderStats(now time.Time) string {
 				state = "dead"
 			}
 		}
-		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f",
+		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f marked_dead=%d recovered=%d",
 			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
 			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load(),
 			h.probeAttempts.Load(), h.probeFails.Load(),
-			float64(h.probeLastNS.Load())/1e6, probeAvgMS(h))
+			float64(h.probeLastNS.Load())/1e6, probeAvgMS(h),
+			h.markedDead.Load(), h.recovered.Load())
 		if state == "dead" || state == "half_open" {
 			if deadAt := h.deadAt.Load(); deadAt > 0 {
 				fmt.Fprintf(&b, " removed_since=%s", now.Sub(time.Unix(0, deadAt)).Round(time.Second))
@@ -533,6 +534,7 @@ func renderPrometheusMetrics(now time.Time) string {
 	b.WriteString("# HELP socksfilter_upstream_health_probes_total Active health-check probes against this upstream by outcome.\n# TYPE socksfilter_upstream_health_probes_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_health_probe_last_duration_seconds Latency of the most recent active health-check probe (TCP connect plus SOCKS5 handshake; 0 until the first probe).\n# TYPE socksfilter_upstream_health_probe_last_duration_seconds gauge\n")
 	b.WriteString("# HELP socksfilter_upstream_health_probe_duration_seconds Active health-check probe latency (TCP connect plus SOCKS5 handshake) in seconds; both successful and failed probes are observed.\n# TYPE socksfilter_upstream_health_probe_duration_seconds histogram\n")
+	b.WriteString("# HELP socksfilter_upstream_health_transitions_total Cumulative health state transitions of this upstream (marked_dead: alive to removed; recovered: removed to alive); driven by active probes and passive traffic feedback.\n# TYPE socksfilter_upstream_health_transitions_total counter\n")
 	for _, server := range strings.Fields(*servers) {
 		h := getUpstreamHealth(server)
 		up := int64(0)
@@ -564,6 +566,10 @@ func renderPrometheusMetrics(now time.Time) string {
 			promLabelValue(server), formatProbeSeconds(h.probeSumNS.Load()))
 		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_count{upstream=\"%s\"} %d\n",
 			promLabelValue(server), h.probeAttempts.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_health_transitions_total{upstream=\"%s\",event=\"marked_dead\"} %d\n",
+			promLabelValue(server), h.markedDead.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_health_transitions_total{upstream=\"%s\",event=\"recovered\"} %d\n",
+			promLabelValue(server), h.recovered.Load())
 		routeLabel := fmt.Sprintf("{route=\"%s\"", promLabelValue(server))
 		fmt.Fprintf(&b, "socksfilter_relay_bytes_total%s,direction=\"%s\"} %d\n",
 			routeLabel, "client_to_target", h.bytesC2T.Load())
@@ -920,6 +926,12 @@ type upstreamHealth struct {
 	probeLastNS         atomic.Int64
 	probeSumNS          atomic.Int64
 	probeLatencyBuckets [len(probeLatencyUpperBounds)]atomic.Int64
+
+	// 健康状态翻转累计（主动探测与被动流量反馈均计入）：markedDead 为
+	// alive->dead 摘除次数，recovered 为 dead->alive 恢复次数；半开期间的
+	// 重复失败不重新计数。两者持续增长可用于识别节点 flapping。
+	markedDead atomic.Int64
+	recovered  atomic.Int64
 }
 
 // probeLatencyUpperBounds 为主动探测延迟直方图的有限桶上界（秒），对齐
@@ -959,6 +971,7 @@ func (h *upstreamHealth) recordFailure(now time.Time) bool {
 	if h.fails.Add(1) >= healthFailThreshold {
 		if h.alive.Swap(false) {
 			becameDead = true
+			h.markedDead.Add(1)
 		}
 		h.deadAt.Store(now.UnixNano())
 	}
@@ -968,7 +981,11 @@ func (h *upstreamHealth) recordFailure(now time.Time) bool {
 // recordSuccess 记录一次成功，清零失败计数并恢复存活，返回是否发生摘除->恢复转换。
 func (h *upstreamHealth) recordSuccess() bool {
 	h.fails.Store(0)
-	return !h.alive.Swap(true)
+	if !h.alive.Swap(true) {
+		h.recovered.Add(1)
+		return true
+	}
+	return false
 }
 
 // reportUpstreamFailure 被动健康反馈：真实流量拨号/握手/写入上游失败时调用。

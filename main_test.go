@@ -1307,6 +1307,68 @@ func TestHealthCheckProbeCounters(t *testing.T) {
 	}
 }
 
+// TestUpstreamHealthTransitions 验证健康状态翻转计数：只有真正的
+// alive->dead（连续失败达阈值）与 dead->alive 才计数，半开期重复失败、
+// 健康态下的成功/单次失败都不计数；多轮 flapping 累计递增。
+func TestUpstreamHealthTransitions(t *testing.T) {
+	h := &upstreamHealth{}
+	h.alive.Store(true)
+	now := time.Now()
+
+	if h.recordSuccess() {
+		t.Fatal("recordSuccess on healthy upstream must not report a transition")
+	}
+	if h.markedDead.Load() != 0 || h.recovered.Load() != 0 {
+		t.Fatal("counters must start at zero")
+	}
+
+	// 第一次失败未达阈值：不翻转
+	if h.recordFailure(now) {
+		t.Fatal("first failure must not mark dead")
+	}
+	// 第二次失败达阈值：alive -> dead
+	if !h.recordFailure(now) {
+		t.Fatal("second consecutive failure must mark dead")
+	}
+	if h.markedDead.Load() != 1 {
+		t.Errorf("markedDead=%d, want 1", h.markedDead.Load())
+	}
+	// 摘除后的额外失败（含半开期重试失败）不重复计数
+	if h.recordFailure(now) {
+		t.Fatal("failure while already dead must not report a transition")
+	}
+	if h.markedDead.Load() != 1 {
+		t.Errorf("markedDead=%d, want still 1", h.markedDead.Load())
+	}
+
+	// 一次成功恢复：dead -> alive
+	if !h.recordSuccess() {
+		t.Fatal("success while dead must report a recovery")
+	}
+	if h.recovered.Load() != 1 {
+		t.Errorf("recovered=%d, want 1", h.recovered.Load())
+	}
+	// 健康态下的成功不重复计数
+	if h.recordSuccess() {
+		t.Fatal("success while healthy must not report a transition")
+	}
+	if h.recovered.Load() != 1 {
+		t.Errorf("recovered=%d, want still 1", h.recovered.Load())
+	}
+
+	// 第二轮 flapping：计数继续累加
+	h.recordFailure(now)
+	if !h.recordFailure(now) {
+		t.Fatal("expected second alive->dead transition")
+	}
+	if !h.recordSuccess() {
+		t.Fatal("expected second dead->alive transition")
+	}
+	if h.markedDead.Load() != 2 || h.recovered.Load() != 2 {
+		t.Errorf("after second flap markedDead=%d recovered=%d, want 2/2", h.markedDead.Load(), h.recovered.Load())
+	}
+}
+
 func TestHealthCheckUnreachableDead(t *testing.T) {
 	resetUpstreamHealth()
 	t.Cleanup(resetUpstreamHealth)
@@ -3540,6 +3602,8 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	getUpstreamHealth(srv0).probeFails.Store(6)
 	getUpstreamHealth(srv0).probeLastNS.Store(1_500_000) // 1.5ms
 	getUpstreamHealth(srv0).probeSumNS.Store(6_000_000)  // avg 0.1ms over 60 probes
+	getUpstreamHealth(srv0).markedDead.Store(3)
+	getUpstreamHealth(srv0).recovered.Store(2)
 	directSessActive := gRouteSessionsActiveDirect.Load()
 	directSessTotal := gRouteSessionsTotalDirect.Load()
 	gRouteSessionsActiveDirect.Store(21)
@@ -3562,7 +3626,7 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 		if line == "" {
 			t.Fatalf("missing upstream line for %s", srv)
 		}
-		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0", "probe_last_ms=0.000", "probe_avg_ms=0.000"}
+		wants := []string{"attempts=0", "established=0", "connect_fails=0", "bytes_c2t=0", "bytes_t2c=0", "sessions_active=0", "probe_attempts=0", "probe_fails=0", "probe_last_ms=0.000", "probe_avg_ms=0.000", "marked_dead=0", "recovered=0"}
 		if srv == srv0 {
 			wants[3] = "bytes_c2t=111"
 			wants[4] = "bytes_t2c=222"
@@ -3571,6 +3635,8 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 			wants[7] = "probe_fails=6"
 			wants[8] = "probe_last_ms=1.500"
 			wants[9] = "probe_avg_ms=0.100"
+			wants[10] = "marked_dead=3"
+			wants[11] = "recovered=2"
 		}
 		for _, want := range wants {
 			if !strings.Contains(line, want) {
@@ -3851,6 +3917,7 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_upstream_health_probes_total":                "counter",
 		"socksfilter_upstream_health_probe_last_duration_seconds": "gauge",
 		"socksfilter_upstream_health_probe_duration_seconds":      "histogram",
+		"socksfilter_upstream_health_transitions_total":           "counter",
 	} {
 		if !strings.Contains(text, "# TYPE "+name+" "+typ) {
 			t.Errorf("missing TYPE declaration for %s %s", name, typ)
@@ -3882,8 +3949,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 96 {
-		t.Fatalf("expected >=96 metric samples, got %d", samples)
+	if samples < 102 {
+		t.Fatalf("expected >=102 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -4245,6 +4312,41 @@ func TestPrometheusMetricsProbeLatency(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+// TestPrometheusMetricsHealthTransitions 验证健康状态翻转 counter：srv0
+// 写入 2 次摘除/1 次恢复后输出对应样本，其余上游输出两个零值样本。
+func TestPrometheusMetricsHealthTransitions(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	srv0 := strings.Fields(*servers)[0]
+	getUpstreamHealth(srv0).markedDead.Store(2)
+	getUpstreamHealth(srv0).recovered.Store(1)
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_health_transitions_total counter") {
+		t.Fatal("missing TYPE declaration for socksfilter_upstream_health_transitions_total")
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`socksfilter_upstream_health_transitions_total{upstream=%q,event="marked_dead"} 2`, srv0),
+		fmt.Sprintf(`socksfilter_upstream_health_transitions_total{upstream=%q,event="recovered"} 1`, srv0),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+	for _, srv := range strings.Fields(*servers) {
+		if srv == srv0 {
+			continue
+		}
+		for _, event := range []string{"marked_dead", "recovered"} {
+			want := fmt.Sprintf(`socksfilter_upstream_health_transitions_total{upstream=%q,event=%q} 0`, srv, event)
+			if !strings.Contains(text, want) {
+				t.Errorf("metrics output missing zero sample %q", want)
+			}
 		}
 	}
 }
