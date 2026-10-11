@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.8"
+	version = "0.7.9"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -101,6 +101,11 @@ var (
 	gDNSLookupsFailure  atomic.Int64 // 所有解析路径均失败（按既有行为回退直连）
 	gDNSResolveSmart    atomic.Int64 // gResolver 防污染智能解析成功
 	gDNSResolveFallback atomic.Int64 // common.ResolveDomainToIP 系统/DoH 兜底成功
+
+	// 因空闲超时被本端主动回收的会话累计数（用于评估 -idle-timeout /
+	// -udp-idle-timeout 是否过短误伤、或过长无法清理僵尸会话）。
+	gIdleClosedTCP atomic.Int64 // TCP 隧道双向静默超时
+	gIdleClosedUDP atomic.Int64 // UDP 关联双向静默超时
 )
 
 // loadFlagsFromConfig 从 JSON 配置文件填充未在命令行显式指定的 flag。
@@ -376,6 +381,8 @@ func renderStats(now time.Time) string {
 		gDNSLookupsResolved.Load(), gDNSLookupsFailure.Load())
 	fmt.Fprintf(&b, "dns_resolved_source: smart_resolver=%d system_fallback=%d cache_entries=%d\n",
 		gDNSResolveSmart.Load(), gDNSResolveFallback.Load(), dnsCacheSize())
+	fmt.Fprintf(&b, "idle_timeout_closed: tcp=%d udp=%d\n",
+		gIdleClosedTCP.Load(), gIdleClosedUDP.Load())
 
 	b.WriteString("upstreams:\n")
 	for _, server := range strings.Fields(*servers) {
@@ -488,6 +495,11 @@ func renderPrometheusMetrics(now time.Time) string {
 	fmt.Fprintf(&b, "socksfilter_dns_resolutions_total{source=\"%s\"} %d\n", "system_fallback", gDNSResolveFallback.Load())
 	b.WriteString("# HELP socksfilter_dns_cache_entries Current entries held in the route DNS cache.\n# TYPE socksfilter_dns_cache_entries gauge\n")
 	fmt.Fprintf(&b, "socksfilter_dns_cache_entries %d\n", dnsCacheSize())
+
+	// 被空闲超时（-idle-timeout / -udp-idle-timeout）主动回收的会话累计数。
+	b.WriteString("# HELP socksfilter_idle_timeout_closed_total Sessions closed locally after bidirectional idle timeout (tcp tunnels and udp associations).\n# TYPE socksfilter_idle_timeout_closed_total counter\n")
+	fmt.Fprintf(&b, "socksfilter_idle_timeout_closed_total{transport=\"%s\"} %d\n", "tcp", gIdleClosedTCP.Load())
+	fmt.Fprintf(&b, "socksfilter_idle_timeout_closed_total{transport=\"%s\"} %d\n", "udp", gIdleClosedUDP.Load())
 
 	b.WriteString("# HELP socksfilter_max_connections Configured concurrent session limit; 0 means unlimited.\n# TYPE socksfilter_max_connections gauge\n")
 	fmt.Fprintf(&b, "socksfilter_max_connections %d\n", *maxConn)
@@ -1729,6 +1741,8 @@ func process_udp(ctx context.Context, conn *net.TCPConn, targetAddr string) {
 				last := time.Unix(0, assoc.lastActivity.Load())
 				if time.Since(last) >= idle {
 					loggo.Info("udp association idle for %s, closing: client=%s", idle, remoteTCPAddr)
+					// reaper 关连后立即退出，每条关联在本分支恰好计数一次。
+					gIdleClosedUDP.Add(1)
 					_ = conn.Close()
 					return
 				}
@@ -1805,7 +1819,9 @@ func process_proxy_server(ctx context.Context, conn *net.TCPConn, targetAddr str
 
 	loggo.Info("client accept new proxy local tcp %s %s %s", server, tcpsrcaddr.String(), targetAddr)
 
-	relay(ctx, conn, proxyconn, &h.bytesC2T, &h.bytesT2C)
+	if relay(ctx, conn, proxyconn, &h.bytesC2T, &h.bytesT2C) {
+		gIdleClosedTCP.Add(1)
+	}
 
 	return true
 }
@@ -1844,10 +1860,15 @@ func process_direct(ctx context.Context, conn *net.TCPConn, targetAddr string) {
 	gRouteSessionsActiveDirect.Add(1)
 	defer gRouteSessionsActiveDirect.Add(-1)
 
-	relay(ctx, conn, targetconn, &gRouteBytesDirectC2T, &gRouteBytesDirectT2C)
+	if relay(ctx, conn, targetconn, &gRouteBytesDirectC2T, &gRouteBytesDirectT2C) {
+		gIdleClosedTCP.Add(1)
+	}
 }
 
-func relay(ctx context.Context, c1, c2 *net.TCPConn, routeC2T, routeT2C *atomic.Int64) {
+// relay 双向转发直到任一端关闭。返回值 idleClosed 表示隧道是因双向静默超过
+// -idle-timeout 被本端主动回收（i/o timeout），而非对端正常关闭或排空期强制断开；
+// 两个方向即使同时报 timeout，对调用方也只计一次。
+func relay(ctx context.Context, c1, c2 *net.TCPConn, routeC2T, routeT2C *atomic.Int64) (idleClosed bool) {
 	var closeOnce sync.Once
 	closeBoth := func() {
 		_ = c1.Close()
@@ -1878,10 +1899,16 @@ func relay(ctx context.Context, c1, c2 *net.TCPConn, routeC2T, routeT2C *atomic.
 	for i := 0; i < 2; i++ {
 		err := <-errCh
 		if err != nil && err != io.EOF {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				// idleTimeoutReader 的双向静默判定超时（普通读 deadline 不会设置）。
+				idleClosed = true
+			}
 			closeOnce.Do(closeBoth)
 		}
 	}
 	closeOnce.Do(closeBoth)
+	return idleClosed
 }
 
 func proxy(destination *net.TCPConn, source *net.TCPConn, dst string, src string, errCh chan error, idle time.Duration, lastActivity *atomic.Int64, byteCounter *atomic.Int64, routeCounter *atomic.Int64) {

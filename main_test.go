@@ -2570,6 +2570,7 @@ func TestStatsHTTPEndpoint(t *testing.T) {
 		"route_relay_bytes(tcp+udp payload): direct_c2t=",
 		"route_sessions(tcp+udp): direct_active=",
 		"dns_lookups: literal=",
+		"idle_timeout_closed: tcp=",
 		"upstreams:",
 	} {
 		if !strings.Contains(text, want) {
@@ -3516,6 +3517,60 @@ func TestStatsRendersUpstreamCounters(t *testing.T) {
 	}
 }
 
+// TestIdleClosedTCPCounter 验证 TCP 隧道双向静默超过 -idle-timeout 被回收时
+// gIdleClosedTCP 恰好 +1；有数据交互期间不计，正常关闭也不计。
+func TestIdleClosedTCPCounter(t *testing.T) {
+	init_env()
+	withIdleFlag(t, 1)
+
+	echoAddr, cleanupEcho := startEchoTCP(t)
+	defer cleanupEcho()
+	sfAddr, _, _, _ := serveTestEnv(t)
+
+	client := socksConnectTo(t, sfAddr, echoAddr)
+	ping := []byte("idle-count-ping")
+	if _, err := client.Write(ping); err != nil {
+		t.Fatalf("write ping fail: %v", err)
+	}
+	pong := make([]byte, len(ping))
+	if _, err := io.ReadFull(client, pong); err != nil {
+		t.Fatalf("read pong fail: %v", err)
+	}
+
+	before := gIdleClosedTCP.Load()
+	// 此后双向静默，约一个 idle 周期后隧道应被服务端主动关闭并计数。
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := client.Read(make([]byte, 16)); err == nil {
+		t.Fatal("expected silent tunnel closed by idle timeout")
+	}
+	waitFor(t, "tcp idle close counted", 5*time.Second, func() bool {
+		return gIdleClosedTCP.Load() == before+1
+	})
+}
+
+// TestIdleClosedUDPCounter 验证 UDP 关联双向静默超过 -udp-idle-timeout 被回收时
+// gIdleClosedUDP 恰好 +1。
+func TestIdleClosedUDPCounter(t *testing.T) {
+	init_env()
+	withUDPIdleFlag(t, 1)
+
+	echoConn, cleanupEcho := startUDPEcho(t)
+	defer cleanupEcho()
+	sfAddr, _, _, _ := serveTestEnv(t)
+
+	clientTCP, clientUDP, relayAddr := udpAssocEnv(t, sfAddr)
+	defer clientTCP.Close()
+	udpRoundtrip(t, clientUDP, relayAddr, echoConn.LocalAddr().(*net.UDPAddr))
+
+	before := gIdleClosedUDP.Load()
+	if !tcpClosed(t, clientTCP, 3*time.Second) {
+		t.Fatal("expected silent udp association control tcp closed by idle timeout")
+	}
+	waitFor(t, "udp idle close counted", 3*time.Second, func() bool {
+		return gIdleClosedUDP.Load() == before+1
+	})
+}
+
 // TestStatsRendersDNSCounters 验证 /stats 的两行 DNS 指标按计数器现值渲染。
 func TestStatsRendersDNSCounters(t *testing.T) {
 	saved := [6]int64{
@@ -3545,6 +3600,23 @@ func TestStatsRendersDNSCounters(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("stats text missing %q:\n%s", want, text)
 		}
+	}
+}
+
+// TestStatsRendersIdleCounters 验证 /stats 的空闲回收行按计数器现值渲染。
+func TestStatsRendersIdleCounters(t *testing.T) {
+	beforeTCP := gIdleClosedTCP.Load()
+	beforeUDP := gIdleClosedUDP.Load()
+	gIdleClosedTCP.Store(31)
+	gIdleClosedUDP.Store(17)
+	t.Cleanup(func() {
+		gIdleClosedTCP.Store(beforeTCP)
+		gIdleClosedUDP.Store(beforeUDP)
+	})
+
+	text := renderStats(time.Now())
+	if !strings.Contains(text, "idle_timeout_closed: tcp=31 udp=17") {
+		t.Errorf("stats text missing idle counters:\n%s", text)
 	}
 }
 
@@ -3603,6 +3675,7 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 		"socksfilter_dns_lookups_total":                   "counter",
 		"socksfilter_dns_resolutions_total":               "counter",
 		"socksfilter_dns_cache_entries":                   "gauge",
+		"socksfilter_idle_timeout_closed_total":           "counter",
 		"socksfilter_max_connections":                     "gauge",
 		"socksfilter_upstream_up":                         "gauge",
 		"socksfilter_upstream_consecutive_failures":       "gauge",
@@ -3640,8 +3713,8 @@ func TestPrometheusMetricsEndpoint(t *testing.T) {
 			t.Errorf("missing value on line: %q", line)
 		}
 	}
-	if samples < 40 {
-		t.Fatalf("expected >=40 metric samples, got %d", samples)
+	if samples < 42 {
+		t.Fatalf("expected >=42 metric samples, got %d", samples)
 	}
 	if want := "socksfilter_build_info{version=\"" + version + "\"} 1"; !strings.Contains(text, want) {
 		t.Errorf("missing build info sample %q", want)
@@ -3847,6 +3920,29 @@ func TestPrometheusMetricsDNSCounters(t *testing.T) {
 	}
 	if !strings.Contains(text, "socksfilter_dns_cache_entries ") {
 		t.Errorf("metrics output missing dns_cache_entries sample:\n%s", text)
+	}
+}
+
+// TestPrometheusMetricsIdleCounters 验证空闲回收 counter 按 transport 标签输出。
+func TestPrometheusMetricsIdleCounters(t *testing.T) {
+	beforeTCP := gIdleClosedTCP.Load()
+	beforeUDP := gIdleClosedUDP.Load()
+	gIdleClosedTCP.Store(8)
+	gIdleClosedUDP.Store(3)
+	t.Cleanup(func() {
+		gIdleClosedTCP.Store(beforeTCP)
+		gIdleClosedUDP.Store(beforeUDP)
+	})
+
+	text := renderPrometheusMetrics(time.Now())
+	for _, want := range []string{
+		"# TYPE socksfilter_idle_timeout_closed_total counter",
+		`socksfilter_idle_timeout_closed_total{transport="tcp"} 8`,
+		`socksfilter_idle_timeout_closed_total{transport="udp"} 3`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
 	}
 }
 
