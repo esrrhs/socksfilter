@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "0.7.17"
+	version = "0.7.18"
 
 	configPath         = flag.String("config", "", "load flags from a JSON config file; explicit command-line flags take precedence")
 	listen             = flag.String("l", ":1080", "listen addr")
@@ -396,11 +396,12 @@ func renderStats(now time.Time) string {
 	for _, server := range strings.Fields(*servers) {
 		h := getUpstreamHealth(server)
 		state := h.state(now)
-		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f marked_dead=%d recovered=%d traffic_dial=%d traffic_handshake=%d traffic_request=%d traffic_write=%d",
+		fmt.Fprintf(&b, "  %s: state=%s fails=%d attempts=%d established=%d connect_fails=%d bytes_c2t=%d bytes_t2c=%d sessions_active=%d probe_attempts=%d probe_fails=%d probe_last_ms=%.3f probe_avg_ms=%.3f establish_last_ms=%.3f establish_avg_ms=%.3f marked_dead=%d recovered=%d traffic_dial=%d traffic_handshake=%d traffic_request=%d traffic_write=%d",
 			server, state, h.fails.Load(), h.attempts.Load(), h.established.Load(), h.connectFails.Load(),
 			h.bytesC2T.Load(), h.bytesT2C.Load(), h.sessionsActive.Load(),
 			h.probeAttempts.Load(), h.probeFails.Load(),
 			float64(h.probeLastNS.Load())/1e6, probeAvgMS(h),
+			float64(h.establishLastNS.Load())/1e6, establishAvgMS(h),
 			h.markedDead.Load(), h.recovered.Load(),
 			h.trafficFailsDial.Load(), h.trafficFailsHandshake.Load(), h.trafficFailsRequest.Load(), h.trafficFailsWrite.Load())
 		if state == "dead" || state == "half_open" {
@@ -443,8 +444,8 @@ func promLabelValue(s string) string {
 	return s
 }
 
-// formatProbeSeconds 将纳秒探测耗时格式化为 Prometheus 秒值（6 位小数）。
-func formatProbeSeconds(ns int64) string {
+// formatSeconds 将纳秒耗时格式化为 Prometheus 秒值（6 位小数）。
+func formatSeconds(ns int64) string {
 	return strconv.FormatFloat(float64(ns)/float64(time.Second), 'f', 6, 64)
 }
 
@@ -529,6 +530,8 @@ func renderPrometheusMetrics(now time.Time) string {
 	b.WriteString("# HELP socksfilter_upstream_health_probes_total Active health-check probes against this upstream by outcome.\n# TYPE socksfilter_upstream_health_probes_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_health_probe_last_duration_seconds Latency of the most recent active health-check probe (TCP connect plus SOCKS5 handshake; 0 until the first probe).\n# TYPE socksfilter_upstream_health_probe_last_duration_seconds gauge\n")
 	b.WriteString("# HELP socksfilter_upstream_health_probe_duration_seconds Active health-check probe latency (TCP connect plus SOCKS5 handshake) in seconds; both successful and failed probes are observed.\n# TYPE socksfilter_upstream_health_probe_duration_seconds histogram\n")
+	b.WriteString("# HELP socksfilter_upstream_session_establish_last_duration_seconds Latency of the most recent real-traffic session establishment attempt via this upstream (TCP connect plus SOCKS5 handshake plus CONNECT/UDP-ASSOCIATE request; 0 until the first attempt).\n# TYPE socksfilter_upstream_session_establish_last_duration_seconds gauge\n")
+	b.WriteString("# HELP socksfilter_upstream_session_establish_duration_seconds Real-traffic session establishment latency via this upstream (TCP connect plus SOCKS5 handshake plus CONNECT/UDP-ASSOCIATE request) in seconds; both successful and failed attempts are observed, and count equals session attempts.\n# TYPE socksfilter_upstream_session_establish_duration_seconds histogram\n")
 	b.WriteString("# HELP socksfilter_upstream_health_transitions_total Cumulative health state transitions of this upstream (marked_dead: alive to removed; recovered: removed to alive); driven by active probes and passive traffic feedback.\n# TYPE socksfilter_upstream_health_transitions_total counter\n")
 	b.WriteString("# HELP socksfilter_upstream_traffic_failures_total Passive real-traffic failures while using this upstream, by failure stage (dial: TCP connect; handshake: SOCKS5 method/auth handshake; request: CONNECT/UDP-ASSOCIATE request phase, including target-unreachable replies, counted without affecting health; write: relay write after the session was up); active health probes are excluded.\n# TYPE socksfilter_upstream_traffic_failures_total counter\n")
 	for _, server := range strings.Fields(*servers) {
@@ -557,10 +560,10 @@ func renderPrometheusMetrics(now time.Time) string {
 		fmt.Fprintf(&b, "socksfilter_upstream_health_probes_total{upstream=\"%s\",outcome=\"failure\"} %d\n",
 			promLabelValue(server), h.probeFails.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_last_duration_seconds{upstream=\"%s\"} %s\n",
-			promLabelValue(server), formatProbeSeconds(h.probeLastNS.Load()))
+			promLabelValue(server), formatSeconds(h.probeLastNS.Load()))
 		// 直方图观测桶以非累积形式存储，渲染时现场累加；+Inf/count 取探测总次数。
 		var bucketCumulative int64
-		for i, upperBound := range probeLatencyUpperBounds {
+		for i, upperBound := range latencyUpperBounds {
 			bucketCumulative += h.probeLatencyBuckets[i].Load()
 			fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_bucket{upstream=\"%s\",le=\"%s\"} %d\n",
 				promLabelValue(server), strconv.FormatFloat(upperBound, 'f', -1, 64), bucketCumulative)
@@ -568,9 +571,24 @@ func renderPrometheusMetrics(now time.Time) string {
 		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_bucket{upstream=\"%s\",le=\"+Inf\"} %d\n",
 			promLabelValue(server), h.probeAttempts.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_sum{upstream=\"%s\"} %s\n",
-			promLabelValue(server), formatProbeSeconds(h.probeSumNS.Load()))
+			promLabelValue(server), formatSeconds(h.probeSumNS.Load()))
 		fmt.Fprintf(&b, "socksfilter_upstream_health_probe_duration_seconds_count{upstream=\"%s\"} %d\n",
 			promLabelValue(server), h.probeAttempts.Load())
+		// 真实流量建立延迟：与探测延迟同一套桶上界，+Inf/count 取会话建立尝试次数。
+		fmt.Fprintf(&b, "socksfilter_upstream_session_establish_last_duration_seconds{upstream=\"%s\"} %s\n",
+			promLabelValue(server), formatSeconds(h.establishLastNS.Load()))
+		var establishBucketCumulative int64
+		for i, upperBound := range latencyUpperBounds {
+			establishBucketCumulative += h.establishLatencyBuckets[i].Load()
+			fmt.Fprintf(&b, "socksfilter_upstream_session_establish_duration_seconds_bucket{upstream=\"%s\",le=\"%s\"} %d\n",
+				promLabelValue(server), strconv.FormatFloat(upperBound, 'f', -1, 64), establishBucketCumulative)
+		}
+		fmt.Fprintf(&b, "socksfilter_upstream_session_establish_duration_seconds_bucket{upstream=\"%s\",le=\"+Inf\"} %d\n",
+			promLabelValue(server), h.attempts.Load())
+		fmt.Fprintf(&b, "socksfilter_upstream_session_establish_duration_seconds_sum{upstream=\"%s\"} %s\n",
+			promLabelValue(server), formatSeconds(h.establishSumNS.Load()))
+		fmt.Fprintf(&b, "socksfilter_upstream_session_establish_duration_seconds_count{upstream=\"%s\"} %d\n",
+			promLabelValue(server), h.attempts.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_health_transitions_total{upstream=\"%s\",event=\"marked_dead\"} %d\n",
 			promLabelValue(server), h.markedDead.Load())
 		fmt.Fprintf(&b, "socksfilter_upstream_health_transitions_total{upstream=\"%s\",event=\"recovered\"} %d\n",
@@ -972,7 +990,18 @@ type upstreamHealth struct {
 	// 再现场累加为累积桶，超过最大上界的观测只落入 +Inf。
 	probeLastNS         atomic.Int64
 	probeSumNS          atomic.Int64
-	probeLatencyBuckets [len(probeLatencyUpperBounds)]atomic.Int64
+	probeLatencyBuckets [len(latencyUpperBounds)]atomic.Int64
+
+	// 真实流量会话建立延迟（区别于主动探测的 probe*，衡量客户端感知的
+	// 建立耗时）：establishLastNS 为最近一次建立尝试耗时（尚未尝试过为 0），
+	// establishSumNS 为累计耗时（配合 attempts 可得平均耗时，观测次数与
+	// attempts 一一对应）；establishLatencyBuckets 与探测直方图共用同一组
+	// 桶上界，保存非累积观测，渲染 Prometheus 时再现场累加。
+	// 计时范围：TCP 连接 + SOCKS5 握手 + CONNECT/UDP-ASSOCIATE 请求阶段，
+	// 成功计到建立成功瞬间、失败计到失败点，成功与失败均记录。
+	establishLastNS         atomic.Int64
+	establishSumNS          atomic.Int64
+	establishLatencyBuckets [len(latencyUpperBounds)]atomic.Int64
 
 	// 健康状态翻转累计（主动探测与被动流量反馈均计入）：markedDead 为
 	// alive->dead 摘除次数，recovered 为 dead->alive 恢复次数；半开期间的
@@ -1012,9 +1041,10 @@ var trafficFailStages = []string{
 // upstreamHealth.state(now) 的取值一一对应。
 var upstreamHealthStates = []string{"alive", "half_open", "dead"}
 
-// probeLatencyUpperBounds 为主动探测延迟直方图的有限桶上界（秒），对齐
-// Prometheus 默认延迟桶；超过最后一个上界的观测仅计入 +Inf 桶。
-var probeLatencyUpperBounds = [...]float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
+// latencyUpperBounds 为延迟直方图的有限桶上界（秒），对齐 Prometheus 默认
+// 延迟桶；主动探测延迟与真实流量会话建立延迟两个直方图共用。超过最后一个
+// 上界的观测仅计入 +Inf 桶。
+var latencyUpperBounds = [...]float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
 
 var gUpstreamHealth sync.Map // server -> *upstreamHealth
 
@@ -1127,20 +1157,34 @@ func reportUpstreamSuccess(server string) {
 	}
 }
 
-// recordProbeLatency 记录一次主动探测的端到端耗时（TCP 连接 + SOCKS5 握手，
-// 成功与失败均记录）：更新最近值、累计和，并给首个不小于耗时的桶 +1。
-func (h *upstreamHealth) recordProbeLatency(d time.Duration) {
+// recordLatencyObs 记录一次延迟观测：更新最近值、累计和，并给首个不小于耗时
+// 的有限桶 +1；超过最大上界的观测只计入渲染时的 +Inf 桶。
+// 主动探测延迟与真实流量会话建立延迟共用这套记账逻辑与桶上界。
+func recordLatencyObs(lastNS, sumNS *atomic.Int64, buckets *[len(latencyUpperBounds)]atomic.Int64, d time.Duration) {
 	ns := d.Nanoseconds()
-	h.probeLastNS.Store(ns)
-	h.probeSumNS.Add(ns)
+	lastNS.Store(ns)
+	sumNS.Add(ns)
 	secs := float64(ns) / float64(time.Second)
-	for i, upperBound := range probeLatencyUpperBounds {
+	for i, upperBound := range latencyUpperBounds {
 		if secs <= upperBound {
-			h.probeLatencyBuckets[i].Add(1)
+			buckets[i].Add(1)
 			return
 		}
 	}
 	// 超过最大有限桶上界：仅计入渲染时的 +Inf 桶
+}
+
+// recordProbeLatency 记录一次主动探测的端到端耗时（TCP 连接 + SOCKS5 握手，
+// 成功与失败均记录）。
+func (h *upstreamHealth) recordProbeLatency(d time.Duration) {
+	recordLatencyObs(&h.probeLastNS, &h.probeSumNS, &h.probeLatencyBuckets, d)
+}
+
+// recordEstablishLatency 记录一次真实流量会话建立尝试的耗时（TCP 连接 +
+// SOCKS5 握手 + CONNECT/UDP-ASSOCIATE 请求阶段，成功计到建立成功瞬间、
+// 失败计到失败点，成功与失败均记录）。
+func (h *upstreamHealth) recordEstablishLatency(d time.Duration) {
+	recordLatencyObs(&h.establishLastNS, &h.establishSumNS, &h.establishLatencyBuckets, d)
 }
 
 // probeAvgMS 返回累计平均主动探测耗时（毫秒）；尚无探测时为 0。
@@ -1150,6 +1194,16 @@ func probeAvgMS(h *upstreamHealth) float64 {
 		return 0
 	}
 	return float64(h.probeSumNS.Load()) / 1e6 / float64(n)
+}
+
+// establishAvgMS 返回累计平均真实流量会话建立耗时（毫秒）；尚未尝试过为 0。
+// 观测次数与 attempts 一一对应（每次建立尝试恰好计时一次）。
+func establishAvgMS(h *upstreamHealth) float64 {
+	n := h.attempts.Load()
+	if n == 0 {
+		return 0
+	}
+	return float64(h.establishSumNS.Load()) / 1e6 / float64(n)
 }
 
 // probeUpstream 对上游做一次探测：TCP 连接 + SOCKS5 客户端握手（含账密认证）。
@@ -1764,9 +1818,13 @@ func (assoc *udpAssociation) getOrCreateUpstreamSession(server string) (*udpUpst
 	h := getUpstreamHealth(server)
 	h.attempts.Add(1)
 	created := false
+	// 建立耗时从拨号前起算：成功计到 UDP ASSOCIATE 请求通过，失败由 defer
+	// 计到失败点，两种结果恰好计时一次。
+	start := time.Now()
 	defer func() {
 		if !created {
 			h.connectFails.Add(1)
+			h.recordEstablishLatency(time.Since(start))
 		}
 	}()
 
@@ -1866,6 +1924,7 @@ func (assoc *udpAssociation) getOrCreateUpstreamSession(server string) (*udpUpst
 	h.established.Add(1)
 	h.sessionsActive.Add(1) // 与 session.close() 的 -1 配对
 	created = true
+	h.recordEstablishLatency(time.Since(start))
 	loggo.Info("udp established upstream session to %s (relay %s) for client %s", server, relayUDPAddr, assoc.clientTCPRemoteAddr)
 	return session, nil
 }
@@ -2012,9 +2071,13 @@ func process_proxy_server(ctx context.Context, conn *net.TCPConn, targetAddr str
 	h.attempts.Add(1)
 	// 任一提前返回都计一次建立失败；成功路径在 Sock5SetRequest 通过后置 established 标志。
 	established := false
+	// 建立耗时从拨号前起算：成功计到 Sock5SetRequest 通过（客户端感知的建立
+	// 瞬间），失败由 defer 计到失败点，两种结果恰好计时一次。
+	start := time.Now()
 	defer func() {
 		if !established {
 			h.connectFails.Add(1)
+			h.recordEstablishLatency(time.Since(start))
 		}
 	}()
 
@@ -2059,6 +2122,7 @@ func process_proxy_server(ctx context.Context, conn *net.TCPConn, targetAddr str
 	// 会话已建立：成功瞬间入账，随后 relay 即使中断也不改写该口径。
 	h.established.Add(1)
 	established = true
+	h.recordEstablishLatency(time.Since(start))
 	// 经该上游的活跃 TCP 隧道 +1，relay 返回、本函数退出时配对 -1。
 	h.sessionsActive.Add(1)
 	defer h.sessionsActive.Add(-1)

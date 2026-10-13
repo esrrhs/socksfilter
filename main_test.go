@@ -4488,7 +4488,7 @@ func TestRecordProbeLatencyBuckets(t *testing.T) {
 	if h.probeLatencyBuckets[0].Load() != 1 {
 		t.Errorf("first bucket=%d, want 1", h.probeLatencyBuckets[0].Load())
 	}
-	last := len(probeLatencyUpperBounds) - 1
+	last := len(latencyUpperBounds) - 1
 	if h.probeLatencyBuckets[last].Load() != 1 {
 		t.Errorf("last finite bucket=%d, want 1", h.probeLatencyBuckets[last].Load())
 	}
@@ -4881,5 +4881,194 @@ func TestConfigStringAcceptedByBoolFlag(t *testing.T) {
 	}
 	if got := fs.Lookup("version").Value.String(); got != "false" {
 		t.Errorf("version=%q", got)
+	}
+}
+
+// ---- v0.7.18 真实流量会话建立延迟（last/avg + Prometheus 直方图）----
+
+// TestRecordEstablishLatencyBuckets 验证真实流量建立延迟的桶放置与记账：
+// 5ms 恰好落入第一个有限桶、10s 恰好落入最后一个有限桶、超过 10s 仅计
+// +Inf；last/sum 分别记录最近值与累计值。
+func TestRecordEstablishLatencyBuckets(t *testing.T) {
+	h := &upstreamHealth{}
+	h.recordEstablishLatency(5 * time.Millisecond)             // 恰好 0.005s -> 第一个有限桶
+	h.recordEstablishLatency(10 * time.Second)                 // 恰好最大上界 -> 最后一个有限桶
+	h.recordEstablishLatency(10*time.Second + time.Nanosecond) // 溢出 -> 仅 +Inf
+	if h.establishLatencyBuckets[0].Load() != 1 {
+		t.Errorf("first bucket=%d, want 1", h.establishLatencyBuckets[0].Load())
+	}
+	last := len(latencyUpperBounds) - 1
+	if h.establishLatencyBuckets[last].Load() != 1 {
+		t.Errorf("last finite bucket=%d, want 1", h.establishLatencyBuckets[last].Load())
+	}
+	var finite int64
+	for i := range h.establishLatencyBuckets {
+		finite += h.establishLatencyBuckets[i].Load()
+	}
+	if finite != 2 {
+		t.Errorf("finite bucket observations=%d, want 2", finite)
+	}
+	if got := h.establishLastNS.Load(); got != int64(10*time.Second+time.Nanosecond) {
+		t.Errorf("establishLastNS=%d, want %d", got, int64(10*time.Second+time.Nanosecond))
+	}
+	wantSum := int64(5*time.Millisecond) + int64(10*time.Second) + int64(10*time.Second+time.Nanosecond)
+	if got := h.establishSumNS.Load(); got != wantSum {
+		t.Errorf("establishSumNS=%d, want %d", got, wantSum)
+	}
+}
+
+// TestPrometheusMetricsEstablishLatency 验证建立延迟 gauge 与直方图：
+// attempts=3、3 次观测（0.0001s / 3s / 30s），有限桶按累积口径渲染，30s
+// 只落入 +Inf，sum=33.0001s、count 与 +Inf 均等于会话建立尝试次数 3。
+func TestPrometheusMetricsEstablishLatency(t *testing.T) {
+	oldServers := *servers
+	srv := "127.0.0.1:19998"
+	*servers = srv
+	resetUpstreamHealth()
+	t.Cleanup(func() {
+		*servers = oldServers
+		resetUpstreamHealth()
+	})
+
+	h := getUpstreamHealth(srv)
+	h.attempts.Store(3)
+	h.recordEstablishLatency(100 * time.Microsecond) // 0.0001s -> le=0.005
+	h.recordEstablishLatency(3 * time.Second)        // 3s -> le=5
+	h.recordEstablishLatency(30 * time.Second)       // 超过 10s，仅进 +Inf
+
+	text := renderPrometheusMetrics(time.Now())
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_session_establish_last_duration_seconds gauge") {
+		t.Fatal("missing TYPE for establish last duration gauge")
+	}
+	if !strings.Contains(text, "# TYPE socksfilter_upstream_session_establish_duration_seconds histogram") {
+		t.Fatal("missing TYPE for establish duration histogram")
+	}
+	if want := `socksfilter_upstream_session_establish_last_duration_seconds{upstream="127.0.0.1:19998"} 30.000000`; !strings.Contains(text, want) {
+		t.Errorf("missing last-duration sample %q", want)
+	}
+	for _, c := range []struct {
+		le string
+		v  int64
+	}{
+		{"0.005", 1}, {"0.01", 1}, {"0.025", 1}, {"0.05", 1}, {"0.1", 1}, {"0.25", 1},
+		{"0.5", 1}, {"1", 1}, {"2.5", 1}, {"5", 2}, {"10", 2}, {"+Inf", 3},
+	} {
+		want := fmt.Sprintf(`socksfilter_upstream_session_establish_duration_seconds_bucket{upstream=%q,le=%q} %d`, srv, c.le, c.v)
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		`socksfilter_upstream_session_establish_duration_seconds_sum{upstream="127.0.0.1:19998"} 33.000100`,
+		`socksfilter_upstream_session_establish_duration_seconds_count{upstream="127.0.0.1:19998"} 3`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+// TestStatsRendersEstablishLatency 验证 /stats 上游行渲染建立延迟：
+// srv0 写入 4 次尝试、last=2ms、sum=8ms（avg=2ms），其余上游为零值。
+func TestStatsRendersEstablishLatency(t *testing.T) {
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	srv0 := strings.Fields(*servers)[0]
+	h := getUpstreamHealth(srv0)
+	h.attempts.Store(4)
+	h.establishLastNS.Store(2_000_000) // 2ms
+	h.establishSumNS.Store(8_000_000)  // avg 2ms over 4 attempts
+
+	text := renderStats(time.Now())
+	for _, srv := range strings.Fields(*servers) {
+		prefix := "  " + srv + ":"
+		line := ""
+		for _, l := range strings.Split(text, "\n") {
+			if strings.HasPrefix(l, prefix) {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Fatalf("missing upstream line for %s", srv)
+		}
+		wants := []string{"establish_last_ms=0.000", "establish_avg_ms=0.000"}
+		if srv == srv0 {
+			wants = []string{"establish_last_ms=2.000", "establish_avg_ms=2.000"}
+		}
+		for _, want := range wants {
+			if !strings.Contains(line, want) {
+				t.Errorf("upstream line missing %s: %s", want, line)
+			}
+		}
+	}
+}
+
+// TestUpstreamEstablishLatencyRecorded 端到端验证建立延迟埋点：
+// 成功的 TCP 代理会话记录一次建立耗时（last/sum/直方图各一次观测），
+// 失败的拨号同样计时（截至失败点），且 attempts 与观测次数一一对应。
+func TestUpstreamEstablishLatencyRecorded(t *testing.T) {
+	init_env()
+	resetUpstreamHealth()
+	t.Cleanup(resetUpstreamHealth)
+
+	// 第一阶段：经 mock 上游成功建立一次会话
+	echoAddr, cleanupEcho := startEchoTCP(t)
+	t.Cleanup(cleanupEcho)
+	upstreamAddr, cleanupUp := startAuthConnectUpstream(t, "", "", echoAddr)
+	t.Cleanup(cleanupUp)
+
+	withGlobalFlags(t, upstreamAddr, "", "")
+	sfAddr, cleanupSF := startSocksfilterListener(t)
+
+	client := proxyRequestOnce(t, sfAddr)
+	if _, err := client.Write([]byte("establish-ping")); err != nil {
+		t.Fatalf("write fail: %v", err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 32)
+	n, err := client.Read(buf)
+	if err != nil || string(buf[:n]) != "establish-ping" {
+		t.Fatalf("expected echo via upstream, got n=%d err=%v", n, err)
+	}
+	_ = client.Close()
+
+	h := getUpstreamHealth(upstreamAddr)
+	waitFor(t, "establish latency recorded for successful session", 3*time.Second, func() bool {
+		return h.attempts.Load() == 1 && h.established.Load() == 1 &&
+			h.establishLastNS.Load() > 0 && h.establishSumNS.Load() > 0
+	})
+	// 建立耗时必然远小于 10s，有限桶合计应恰好 1 次观测。
+	var finite int64
+	for i := range h.establishLatencyBuckets {
+		finite += h.establishLatencyBuckets[i].Load()
+	}
+	if finite != 1 {
+		t.Errorf("finite bucket observations=%d, want 1", finite)
+	}
+	cleanupSF()
+
+	// 第二阶段：拨号必然失败的上游，失败尝试同样计时一次。
+	// withGlobalFlags 要求写入期间没有连接 goroutine 读 flag，故先停掉上一阶段监听器。
+	dead := "127.0.0.1:1"
+	withGlobalFlags(t, dead, "", "")
+	sfAddr2, cleanupSF2 := startSocksfilterListener(t)
+	t.Cleanup(cleanupSF2)
+
+	c2 := proxyRequestOnce(t, sfAddr2)
+	_ = c2.Close()
+
+	dh := getUpstreamHealth(dead)
+	waitFor(t, "establish latency recorded for failed dial", 3*time.Second, func() bool {
+		return dh.attempts.Load() == 1 && dh.connectFails.Load() == 1 &&
+			dh.establishLastNS.Load() > 0 && dh.establishSumNS.Load() > 0
+	})
+	var deadFinite int64
+	for i := range dh.establishLatencyBuckets {
+		deadFinite += dh.establishLatencyBuckets[i].Load()
+	}
+	if deadFinite != 1 {
+		t.Errorf("dead upstream finite bucket observations=%d, want 1", deadFinite)
 	}
 }
