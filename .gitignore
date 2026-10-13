@@ -28,3 +28,7 @@ build/
 .DS_Store
 .idea/
 .vscode/
+
+
+# WorkBuddy 工作空间记忆（本地）
+.workbuddy/
